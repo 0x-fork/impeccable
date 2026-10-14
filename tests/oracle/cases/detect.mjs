@@ -174,6 +174,7 @@ function Thumb({ url }: { url?: string }) {
     { id: 'detect-config-from-subdir', verb: 'detect', workspace: 'detect-config', cwd: 'src', args: ['--json', 'page.html'] },
     // detector.extensions in directory walks (#822)
     { id: 'detect-config-extensions-dir-json', verb: 'detect', workspace: 'detect-extensions', args: ['--json', '--no-design-system', 'app/views'] },
+    { id: 'detect-config-extensions-file-json', verb: 'detect', workspace: 'detect-extensions', args: ['--json', '--no-design-system', 'app/views/first.html.erb'] },
     { id: 'detect-config-extensions-dir-no-config', verb: 'detect', workspace: 'detect-extensions', args: ['--no-config', '--json', 'app/views'] },
     // A file in one project must not pick up another project's DESIGN.md
     { id: 'detect-config-cross-project', verb: 'detect', workspace: 'detect-config', args: ['--json', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
