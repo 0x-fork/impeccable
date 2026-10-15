@@ -216,6 +216,9 @@ pub const PSEUDO_PROPS: &[&str] = &[
     "visibility",
     "zIndex",
     "translate",
+    "scale",
+    "rotate",
+    "filter",
 ];
 
 /// One child of an element: an element (by id) or a text node's data.
