@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { searchTerms, selectCrates } from '../scripts/lib/rust-test-selection.mjs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { KNOWN_READERS, searchTerms, selectCrates } from '../scripts/lib/rust-test-selection.mjs';
 
 // A small workspace shaped like the real one: core at the bottom, html on
 // core, cli on html, and a dev-dependency edge from tool to core.
@@ -66,6 +68,29 @@ describe('rust-test-selection', () => {
     assert.deepEqual(select(['scripts/test-rust-changed.mjs', 'scripts/lib/build.js', 'package.json'], sources).names, []);
     assert.deepEqual(select(['tests/fixtures/antipatterns/x.html', 'skill/scripts/live-browser.js'], sources).names, []);
     assert.deepEqual(select(['scripts/bundle-signing-keys.json'], sources).names, ['cli', 'html']);
+  });
+
+  it('selects the known readers of paths built with chained joins', () => {
+    const packages = [
+      { name: 'impeccable-core', dir: 'crates/core', deps: [] },
+      { name: 'impeccable-html', dir: 'crates/html', deps: ['impeccable-core'] },
+      { name: 'impeccable-comp', dir: 'crates/comp', deps: [] },
+    ];
+    const { selected } = selectCrates({
+      changed: ['tests/oracle/vectors/calls/engines.static-html.css-cascade/cssPropToCamel.jsonl'],
+      packages,
+      searchCrates: () => [],
+    });
+    assert.deepEqual([...selected.keys()].sort(), ['impeccable-core', 'impeccable-html']);
+    // Every row must name a workspace crate, or a rename silently drops it.
+    const real = readdirSync('crates').flatMap((dir) => {
+      try {
+        return [/^name\s*=\s*"([^"]+)"/m.exec(readFileSync(join('crates', dir, 'Cargo.toml'), 'utf8'))[1]];
+      } catch {
+        return [];
+      }
+    });
+    for (const row of KNOWN_READERS) for (const name of row.crates) assert.ok(real.includes(name), name);
   });
 
   it('builds terms for the file and its directories', () => {

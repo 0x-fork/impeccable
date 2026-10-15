@@ -5,6 +5,15 @@
 
 export const WORKSPACE_FILES = [/^Cargo\.(toml|lock)$/, /^rust-toolchain(\.toml)?$/, /^\.cargo\//];
 
+// Readers the source search cannot see. crates/core/tests/vectors.rs and
+// crates/html/tests/vectors.rs build the vectors path with chained calls,
+// `repo.join("tests").join("oracle").join("vectors")`, so no single string
+// in them names the directory. Add a row here for any other path a crate
+// assembles piece by piece.
+export const KNOWN_READERS = [
+  { prefix: 'tests/oracle/vectors/', crates: ['impeccable-core', 'impeccable-html'] },
+];
+
 // Crates name what they read either relative to their manifest
 // (`include_str!("../../../skill/scripts/live-browser.js")`,
 // `CARGO_MANIFEST_DIR/../../tests/fixtures/concept-catalog`) or from the repo
@@ -51,6 +60,9 @@ export function selectCrates({ changed, packages, searchCrates }) {
       const name = crateOf(file);
       if (name) pick(name, file);
       continue;
+    }
+    for (const { prefix, crates } of KNOWN_READERS) {
+      if (file.startsWith(prefix)) for (const name of crates) pick(name, file);
     }
     for (const hit of searchCrates(searchTerms(file))) {
       const name = crateOf(hit);
