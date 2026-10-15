@@ -77,19 +77,19 @@ The in-page bundle, the oracle goldens and the call vectors are marked `-diff` i
 ```sh
 gh pr diff <n> --name-only                                   # what changed
 gh pr diff <n> --exclude 'tests/oracle/golden/*' --exclude 'tests/oracle/vectors/*' --exclude 'crates/live/assets/detect-antipatterns-browser.js'
-git fetch origin pull/<n>/head && git worktree add --detach "$TMPDIR/pr-<n>" FETCH_HEAD   # Read and grep the PR's files here
-git -C "$TMPDIR/pr-<n>" merge-tree --write-tree --name-only origin/main HEAD   # tree id, then any files that conflict with main
+git fetch origin pull/<n>/head && git worktree add --detach "${TMPDIR:-/tmp}/pr-<n>" FETCH_HEAD   # Read and grep the PR's files here
+git -C "${TMPDIR:-/tmp}/pr-<n>" merge-tree --write-tree --name-only origin/main HEAD   # tree id, then any files that conflict with main
 gh pr checks <n>
 ```
 
-`gh pr diff` ignores `.gitattributes`, hence the `--exclude` flags; a local `git diff` honours the attributes of the checked-out tree, so a branch cut before they landed still prints the raw diff (`-- . ':!tests/oracle/golden' ':!crates/live/assets'` trims it). `git grep` reports these files as binary; use `rg` or `git grep -a`. To review a changed golden by hand, decode it on both sides:
+`gh pr diff` ignores `.gitattributes`, hence the `--exclude` flags. A `gh` too old for `--exclude` can skip that line and diff in the worktree instead: `git -C "${TMPDIR:-/tmp}/pr-<n>" diff origin/main...HEAD -- . ':!tests/oracle/golden' ':!tests/oracle/vectors' ':!crates/live/assets/detect-antipatterns-browser.js'`. The pathspec matters there too: a local `git diff` honours the attributes of the checked-out tree, so a branch cut before they landed still prints the raw diff. `git grep` reports these files as binary; use `rg` or `git grep -a`. To review a changed golden by hand, decode it on both sides:
 
 ```sh
 g='to_entries[]|"== \(.key)\n\(.value|if type=="string" then . else tojson end)"'; f=tests/oracle/golden/<case>.json
 diff <(git show origin/main:$f 2>/dev/null | jq -r "$g") <(git show HEAD:$f | jq -r "$g")   # in the PR worktree; a new case diffs against nothing
 ```
 
-Remove the worktree when done (`git worktree remove "$TMPDIR/pr-<n>"`).
+Remove the worktree when done (`git worktree remove "${TMPDIR:-/tmp}/pr-<n>"`).
 
 ## Contributing, Issue, and PR Guidelines
 
