@@ -1323,6 +1323,16 @@ impl<'a> Page<'a> {
         for candidate in retained {
             if !candidates.contains(candidate) { candidates.push(candidate.clone()); }
         }
+        self.native_pseudo_boxes(world, &candidates)
+    }
+
+    /// Native layout boxes of the named generated boxes (`{index, pseudo}`,
+    /// `pseudo` without colons, `index` in querySelectorAll order): the bounds
+    /// of the border quad, transforms included, in viewport pixels. A generated
+    /// box with no layout box of its own reports `box: null`; one that is not
+    /// generated at all is not listed.
+    pub fn native_pseudo_boxes(&mut self, world: &IsolatedWorld, candidates: &[Value]) -> CdpResult<Value> {
+        self.validate_world(world)?;
         if candidates.len()>256 {return Err(CdpError::new("capture pseudo image candidates exceed bound"));}
         if candidates.is_empty() {return Ok(json!([]));}
         let tree = self.send("DOM.getDocument", json!({"depth":-1}))?;
