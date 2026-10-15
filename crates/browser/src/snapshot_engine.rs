@@ -277,10 +277,12 @@ pub fn resolve_needs_recording<T>(
 /// The design-system config the browser rules read, built the way
 /// `configure-pure-detect` fed `window.__IMPECCABLE_CONFIG__` to the bundle,
 /// plus the rule pack the caller installed (`None` in the `impeccable`
-/// binary).
+/// binary) and the rules the caller leaves out of the report
+/// ([`BrowserConfig::unreported_rules`]).
 pub fn browser_config(
     design_system: Value,
     rule_pack: Option<&'static dyn impeccable_core::rule_pack::RulePack>,
+    unreported_rules: &[String],
 ) -> BrowserConfig {
     BrowserConfig {
         extension_mode: false,
@@ -293,6 +295,7 @@ pub fn browser_config(
             Some(design_system)
         },
         line_length_max: None,
+        unreported_rules: unreported_rules.to_vec(),
         rule_pack,
     }
 }

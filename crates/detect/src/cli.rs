@@ -6,11 +6,12 @@ use std::io::Write;
 
 use impeccable_common::Io;
 use impeccable_core::findings::Finding;
-use impeccable_core::registry::{filter_by_scopes, rule_scopes};
+use impeccable_core::registry::{all_antipatterns, filter_by_scopes, rule_scopes};
 use serde_json::Value;
 
 use crate::config::{
-    filter_detection_findings, read_detection_config, should_ignore_detection_file, DetectionConfig,
+    filter_detection_findings, normalize_ignore_rule, read_detection_config, should_ignore_detection_file,
+    DetectionConfig,
 };
 use crate::design_system::{load_design_system_for_target, DesignSystemCache};
 use crate::detect_text::{detect_text, ext_from_file_path, TextOptions};
@@ -548,6 +549,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         rule_pack: None,
         keep_consent_banners: has(&args, "--no-consent-hiding"),
         keep_overlays: has(&args, "--no-overlay-hiding"),
+        unreported_rules: unreported_rules(&detection_config.ignore_rules, &scopes),
     };
     let targets: Vec<String> = expand_joined_url_targets(
         args.iter()
@@ -692,6 +694,25 @@ const HTML_LIKE_TEMPLATE_EXTS: &[&str] = &[".astro", ".svelte", ".vue"];
 
 /// The #884 note: which files only got the regex engine, what that misses,
 /// and the scan that would run every rule.
+/// The rules whose findings this run removes after the scan, for the
+/// browser engine ([`ScanOptions::unreported_rules`]): every `ignoreRules`
+/// entry, and, when `--scope` narrows the report, every registered rule in
+/// none of the requested scopes ([`filter_by_scopes`]).
+fn unreported_rules(ignore_rules: &[String], scopes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = ignore_rules.iter().map(|r| normalize_ignore_rule(r)).collect();
+    if !scopes.is_empty() {
+        for rule in all_antipatterns() {
+            let in_scope = rule.scopes.unwrap_or(&[]).iter().any(|s| scopes.iter().any(|w| w == s));
+            if !in_scope {
+                out.push(rule.id.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn regex_only_note(n: usize, exts: &BTreeSet<String>, ports: &BTreeSet<u32>) -> String {
     let listed: Vec<&str> = exts.iter().map(String::as_str).filter(|e| !e.is_empty()).collect();
     let mut note = format!(
@@ -1020,5 +1041,23 @@ mod design_note_tests {
         let (_, err) = run(&dir, &page, &CleanHtml);
         assert!(err.contains("purple/violet check is off"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod unreported_rules_tests {
+    use super::unreported_rules;
+
+    /// `low-contrast` declares no scope, so `--scope type` reports
+    /// `tiny-text` and never `low-contrast`: the browser engine is told, so
+    /// a finding the run drops does not stand in for one it keeps.
+    #[test]
+    fn ignored_and_out_of_scope_rules_are_unreported() {
+        assert!(unreported_rules(&[], &[]).is_empty());
+        let ignored = unreported_rules(&[" Low-Contrast ".to_string()], &[]);
+        assert_eq!(ignored, vec!["low-contrast".to_string()]);
+        let scoped = unreported_rules(&[], &["type".to_string()]);
+        assert!(scoped.iter().any(|r| r == "low-contrast"), "{scoped:?}");
+        assert!(!scoped.iter().any(|r| r == "tiny-text"), "{scoped:?}");
     }
 }

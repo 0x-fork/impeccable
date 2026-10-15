@@ -708,6 +708,7 @@ pub fn replay_url_scan(
     let config = snapshot_engine::browser_config(
         serialize_design_system_for_browser(options.design_system.as_deref()),
         options.rule_pack,
+        &options.unreported_rules,
     );
     let (snapshot, facts) = reveal.unwrap_or((scan_snapshot, scan_facts));
     let dom = snapshot_engine::parse_snapshot(snapshot).map_err(cdp_err)?;
@@ -1180,6 +1181,7 @@ fn scan_page_inner(
     let config = snapshot_engine::browser_config(
         serialize_design_system_for_browser(options.design_system.as_deref()),
         options.rule_pack,
+        &options.unreported_rules,
     );
 
     // Reveal sweep before anything is measured: scroll the page top to bottom
