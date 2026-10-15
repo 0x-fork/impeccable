@@ -60,7 +60,7 @@ Notation: `stdout>` / `stderr>` are literal writes; `exit N`; template strings u
      Compatibility:
        impeccable skills <command>       Legacy namespace; still supported.
      ```
-  2. `--version` / `-v` → `console.log(pkg.version)` read from `<cli/bin>/../../package.json`; `exit 0`.
+  2. `--version` / `-v` → `console.log(pkg.version)` read from `<cli/bin>/../../package.json`; `exit 0`. The binary run directly (the skill launcher's path) prints the installed skill's `SKILL.md` frontmatter version instead (skill dir from `IMPECCABLE_SKILL_DIR`, else the binary's path), else `<engine version>+engine`.
   3. `detect` → `process.argv = [argv0, argv1, ...args.slice(1)]`; dynamic-import `../engine/detect-antipatterns.mjs`, `await detectCli()`.
   4. `ignores` or `ignore` → `./commands/ignores.mjs` `run(args.slice(1))`.
   5. `skills` → `./commands/skills.mjs` `run(args.slice(1))` (legacy namespace).

@@ -163,7 +163,12 @@ function Thumb({ url }: { url?: string }) {
     { id: 'detect-unknown-flag', verb: 'detect', args: ['--bogus', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
     { id: 'detect-bad-viewport', verb: 'detect', args: ['--viewport', 'wide', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
     { id: 'cli-help', verb: 'cli-help', args: [] },
-    { id: 'cli-version', verb: 'cli-version', args: [] },
+    {
+      id: 'cli-version', verb: 'cli-version', args: [],
+      // A fixture skill dir keeps the golden off every release cadence.
+      setup: (ws) => fs.writeFileSync(path.join(ws, 'SKILL.md'), '---\nname: impeccable\nversion: 9.9.9\n---\n'),
+      env: { IMPECCABLE_SKILL_DIR: '<WS>' },
+    },
 
     // Project config, DESIGN.md, inline ignores (detect-config workspace)
     { id: 'detect-config-page-json', verb: 'detect', workspace: 'detect-config', args: ['--json', 'src/page.html'] },

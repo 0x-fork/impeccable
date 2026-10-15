@@ -478,6 +478,12 @@ pub(crate) fn read_local_skill_version(provider: &Provider) -> Option<String> {
     parse_skill_frontmatter_version(&content)
 }
 
+/// The installed skill's SKILL.md frontmatter version, resolving the skill
+/// dir the way every verb does (`IMPECCABLE_SKILL_DIR`, else the binary's path).
+pub fn installed_skill_version(env: &Env, cwd: &str) -> Option<String> {
+    read_local_skill_version(&crate::provider::detect(env, cwd))
+}
+
 fn update_cache_path(env: &Env) -> String {
     match env.get("IMPECCABLE_UPDATE_CACHE").filter(|v| !v.is_empty()) {
         Some(p) => p.clone(),

@@ -163,7 +163,7 @@ The npm shim answers `--version` / `-v` itself from its own `package.json`
 installed. The binary's `CLI_VERSION` moves from `3.6.0` to `4.0.0` with the
 CLI 4.0.0 release; it is what the binary prints when run directly.
 
-- `cli-version`.
+- Accepted until 2026-10-15 (#1028): `cli-version`.
 
 ## Recorded 2026-09-12: the URL scan reads the page after the reveal sweep
 
@@ -7064,3 +7064,7 @@ Re-recorded from the binary and reviewed by hand. The organic-clip-path fixture'
 The directory sweeps (`detect-dir-json-all-fixtures`, `detect-dir-text-all-fixtures`, `detect-dir-quiet-all-fixtures`) and the no-advisory sweeps (`detect-no-advisory-json`, `detect-no-advisory-text`) carry exactly those five findings, the two organic-clip-path findings and the three on `gradient-text-one-colour.html` in path order, and the failure count moves from 945 to 950; the advisory count and exit codes did not move. They were recorded again after the merge with main (#1004, #1005, #1006 and the rest), and the diff of each against main's golden is those five findings and the count, nothing else.
 
 Review round, same day. Three review fixes move no golden: the CLI tells the browser engine which rules it removes after the scan (`ignoreRules`, and every rule outside a requested `--scope`; `low-contrast` declares no scope), so a `low-contrast` finding the report will drop does not take an element's size findings with it; gray-on-color's class form stops counting `bg-<hue>-50` and `bg-<hue>-100` as the coloured fill, where the computed form already reads them as off-white; and the stylesheet gradient-text form does not stand down on a neighbour's one-colour gradient when the declaration's own ramp opened before its 200-character window.
+
+## Recorded 2026-10-15: --version prints the installed skill's version (#1028)
+
+The binary printed a hard-coded npm package version that stayed `4.0.0` after 4.5.2 shipped, so the skill launcher's `--version` read as a failed update. `--version` / `-v` now prints the installed skill's `SKILL.md` frontmatter version (skill dir from `IMPECCABLE_SKILL_DIR`, else the binary's path), else `<engine>+engine`, the same fallback token the telemetry client header uses. The npm shim still answers from its own `package.json`. The `cli-version` case stages a fixture `SKILL.md` at 9.9.9, so its golden is `9.9.9` and does not move with a skill or engine release. Re-recorded from the binary and reviewed by hand. The 2026-09-04 history line no longer starts with the case id, so the case is checked.
