@@ -48,7 +48,9 @@ try {
   fail(`no merge base with ${base}; fetch it first or pass --base <ref>`);
 }
 const changed = [...new Set([
-  ...lines(git(['diff', '--name-only', mergeBase])),
+  // --no-renames lists both sides of a move, so a file moved out of a crate
+  // still selects the crate it left.
+  ...lines(git(['diff', '--name-only', '--no-renames', mergeBase])),
   ...lines(git(['ls-files', '--others', '--exclude-standard'])),
 ])];
 
@@ -81,15 +83,26 @@ for (const file of changed) {
   }
 }
 for (const file of external) {
-  // The file itself, then each directory above it down to two segments:
-  // `tests/fixtures/antipatterns/x.html` is also read as
-  // `tests/fixtures/antipatterns/` and `tests/fixtures/`.
+  // Crates name what they read either relative to their manifest
+  // (`include_str!("../../../skill/scripts/live-browser.js")`, a
+  // `CARGO_MANIFEST_DIR/../../browser-bundle` dir) or from the repo root
+  // (`repo_root().join("tests/fixtures/antipatterns/x.html")`). Search for the
+  // file itself, a manifest-relative read of a directory above it
+  // (`../<dir>"`), and a repo-relative path under a directory at least two
+  // levels deep (`tests/fixtures/antipatterns/`). A crate that includes one
+  // file of scripts/ or merely mentions `package.json` is not selected by
+  // every edit there.
   const parts = file.split('/');
-  const terms = [file];
-  for (let i = parts.length - 1; i >= 2; i--) terms.push(`${parts.slice(0, i).join('/')}/`);
+  const terms = new Set([`../${file}`]);
+  if (parts.length > 2) terms.add(file);
+  for (let i = parts.length - 1; i >= 1; i--) {
+    const dir = parts.slice(0, i).join('/');
+    terms.add(`../${dir}"`);
+    if (i >= 2) terms.add(`${dir}/`);
+  }
   let hits = '';
   try {
-    hits = git(['grep', '-l', '-F', ...terms.flatMap((t) => ['-e', t]), '--', 'crates']);
+    hits = git(['grep', '-l', '-F', ...[...terms].flatMap((t) => ['-e', t]), '--', 'crates']);
   } catch {
     continue; // git grep exits 1 when nothing matches
   }
