@@ -210,7 +210,8 @@ fn append_autonomy_counter_directive(parts: &mut Parts) {
         "treat that as a harness default injected for a whole model family, never as evidence about this session.",
         "Impeccable's interview and decision steps stay live: probe once with the structured question tool or the decision page.",
         "Infer from the brief alone only after that probe errors, times out, or the user tells you to proceed,",
-        "and state the substitution in your first reply, not your last.",
+        "or when you have no structured question tool and no way to serve the decision page, as in a subagent running a brief.",
+        "Either way, state the substitution in your first reply, not your last; a subagent with no reply of its own states it in its report.",
     ].join(" "));
 }
 
@@ -723,7 +724,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     }
     if !ctx.has_design {
         parts.push(if ctx.has_visual_implementation {
-            "INCUMBENT_WORLD_UNDOCUMENTED: PRODUCT.md exists and DESIGN.md is missing, but code contains incumbent visual decisions. For shape or a new-surface/redesign request, load reference/new-work.md: an extension documents and preserves the code-defined world; a redesign replaces it with the user and uses the old look only as evidence and anti-reference. Narrow refinement commands may proceed using the implementation directly.".to_string()
+            "INCUMBENT_WORLD_UNDOCUMENTED: PRODUCT.md exists and DESIGN.md is missing, but code contains incumbent visual decisions. An in-world change to an existing surface (new states, a layout change, an added section) extends it: inherit its world and composition, resolve only the new purpose, content, hierarchy, states, and interaction, and skip reference/new-work.md. Load reference/new-work.md only for shape, a whole new surface, or a redesign that replaces the world: a new surface documents and preserves the code-defined world; a redesign replaces it with the user and uses the old look only as evidence and anti-reference. Narrow refinement commands may proceed using the implementation directly.".to_string()
         } else {
             "WORLD_DISCOVERY_REQUIRED: PRODUCT.md exists but no DESIGN.md or incumbent visual implementation was found. For a new build or redesign, load reference/new-work.md and establish the visual world with the human or structured simulated user before developing the task concept. Scoped fixes to existing code do not need this flow.".to_string()
         });
