@@ -1408,6 +1408,10 @@ fn body_text_edge_span(dom: &dyn Dom, q: &QualityInput) -> Option<(f64, f64)> {
     if in_nav_header || has_own_bg || is_positioned || !(width_ratio > 0.5) {
         return None;
     }
+    // Nor does text in a box caught part way through a move that ends.
+    if super::painted::moves_mid_animation(dom, el) {
+        return None;
+    }
     let (left, right) = match phrasing_text_extent(dom, el) {
         Some(t) if scrolling_ancestor_cuts(dom, el, &t) => return None,
         // Text on a track a running animation moves stands wherever the
@@ -4381,6 +4385,143 @@ mod tests {
         );
         assert_eq!(at(&mut d, 1280.0, 12.0).len(), 1);
         assert!(at(&mut d, 1280.0, 16.0).is_empty());
+    }
+
+    /// elevancehealth.com (324856): a quote caught part way through its
+    /// one-shot slide in from the right, 79px past a 390px viewport.
+    #[test]
+    fn text_in_a_box_mid_slide_is_not_measured_against_the_viewport() {
+        use impeccable_foundation::browser::dom::KeyframeFrame;
+        let copy = "Our care teams meet people where they are, and that changes what health looks like.";
+        let frame = |decls: &[(&str, &str)]| KeyframeFrame {
+            decls: decls.iter().map(|(p, v)| (p.to_string(), v.to_string())).collect(),
+        };
+        // `mover` takes the animation (or transition) and its running
+        // properties; `wrapper` says whether a wrapper holds the quote.
+        let run_t = |running: Option<Vec<&str>>, styles: &[(&str, &str)], on_wrapper: bool, wrapper_transform: &str| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.inner_width = 390.0;
+            d.set_rect(html, 0.0, 0.0, 390.0, 2400.0);
+            d.el_mut(html).client_width = 390.0;
+            d.el_mut(html).scroll_width = 469.0;
+            d.set_rect(body, 0.0, 0.0, 390.0, 2400.0);
+            d.keyframes.insert(
+                "quote-appear-right".into(),
+                vec![frame(&[("opacity", "0"), ("right", "-96%")]), frame(&[("opacity", "1"), ("right", "0px")])],
+            );
+            d.keyframes.insert("drift".into(), vec![frame(&[("right", "0px")]), frame(&[("right", "8px")])]);
+            d.keyframes.insert(
+                "fade-up".into(),
+                vec![frame(&[("opacity", "0"), ("transform", "translateY(20px)")]), frame(&[("opacity", "1"), ("transform", "none")])],
+            );
+            d.keyframes.insert(
+                "fade-up-offset".into(),
+                vec![
+                    frame(&[("opacity", "0"), ("transform", "translateX(40px) translateY(20px)")]),
+                    frame(&[("opacity", "1"), ("transform", "translate(40px, 0px)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "grow-tall".into(),
+                vec![
+                    frame(&[("transform", "matrix(1, 0, 0, 1.2, 40, 0)")]),
+                    frame(&[("transform", "translateX(40px)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "grow-in-place".into(),
+                vec![
+                    frame(&[("transform", "matrix(1.2, 0, 0, 1.2, 40, 0)")]),
+                    frame(&[("transform", "matrix(1, 0, 0, 1, 40, 0)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "slide-in".into(),
+                vec![frame(&[("transform", "translateX(120px)")]), frame(&[("transform", "translateX(0px)")])],
+            );
+            let wrapper = d.add(Some(body), "main");
+            d.set_rect(wrapper, 0.0, 0.0, 390.0, 2400.0);
+            d.set_style(wrapper, "transform", wrapper_transform);
+            let quote = d.add(Some(wrapper), "div");
+            d.set_style(quote, "position", "relative");
+            d.set_rect(quote, 119.0, 700.0, 350.0, 320.0);
+            let mover = if on_wrapper { wrapper } else { quote };
+            d.set_styles(mover, styles);
+            d.el_mut(mover).running_animations = running.map(|r| r.into_iter().map(String::from).collect());
+            let p = text_el(&mut d, quote, "p", copy, "16px");
+            d.set_style(p, "lineHeight", "24px");
+            d.set_rect(p, 143.0, 724.0, 310.0, 96.0);
+            d.set_text_rect(p, 143.0, 724.0, 310.0, 96.0);
+            check_page_overflow_dom(&d).len()
+        };
+        let run = |running: Option<Vec<&str>>, styles: &[(&str, &str)], on_wrapper: bool| {
+            run_t(running, styles, on_wrapper, "none")
+        };
+        let run_skewed =
+            |running: Option<Vec<&str>>, styles: &[(&str, &str)]| run_t(running, styles, false, "matrix(1, 0, 0.2, 1, 0, 0)");
+        let slide = [("animationName", "quote-appear-right"), ("animationIterationCount", "1")];
+        assert_eq!(run(Some(vec!["right", "opacity"]), &slide, false), 0);
+        // A transition that names the property traces it too.
+        let eased = [("transitionProperty", "left"), ("transitionDuration", "0.4s")];
+        assert_eq!(run(Some(vec!["left"]), &eased, false), 0);
+        // At rest, or in a loop, the box stands where it was measured.
+        assert_eq!(run(Some(vec!["opacity"]), &slide, false), 1);
+        let looped = [("animationName", "quote-appear-right"), ("animationIterationCount", "infinite")];
+        assert_eq!(run(Some(vec!["right"]), &looped, false), 1);
+        // Half an iteration still ends.
+        let half = [("animationName", "quote-appear-right"), ("animationIterationCount", "0.5")];
+        assert_eq!(run(Some(vec!["right"]), &half, false), 0);
+        // A one-shot entrance beside an infinite drift on the same property:
+        // the capture cannot tell which one moves it, and the drift never
+        // stops.
+        let mixed = [
+            ("animationName", "quote-appear-right, drift"),
+            ("animationIterationCount", "1, infinite"),
+        ];
+        assert_eq!(run(Some(vec!["right"]), &mixed, false), 1);
+        // A recording that did not read running animations.
+        assert_eq!(run(None, &slide, false), 1);
+        // A fade-up on an ancestor moves the text vertically only: the
+        // overflow is real whatever frame the entrance was caught at.
+        let fade_up = [("animationName", "fade-up"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 0, 12)")];
+        assert_eq!(run(Some(vec!["transform", "opacity"]), &fade_up, true), 1);
+        // A fade-up that keeps the same x offset in every frame moves only
+        // on y (review): the sideways offset the capture read is where the
+        // box ends, and the overflow is real.
+        let held = [("animationName", "fade-up-offset"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 40, 12)")];
+        assert_eq!(run(Some(vec!["transform", "opacity"]), &held, false), 1);
+        // A transform slide that changes x is still a move that ends.
+        let slide_x = [("animationName", "slide-in"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 79, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &slide_x, false), 0);
+        // A matrix that keeps x at 40px but scales moves what the box holds
+        // sideways (review): still a move that ends.
+        let grow = [("animationName", "grow-in-place"), ("animationIterationCount", "1"), ("transform", "matrix(1.1, 0, 0, 1.1, 40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &grow, false), 0);
+        // One that scales only y keeps x where it is (review): the overflow
+        // stays after the animation.
+        let tall = [("animationName", "grow-tall"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1.1, 40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &tall, false), 1);
+        // Under a wrapper that skews what it holds, a change of y moves the
+        // text sideways on screen (review): still a move that ends.
+        let tall_skewed = [
+            ("animationName", "grow-tall"),
+            ("animationIterationCount", "1"),
+            ("transform", "matrix(1, 0, 0, 1.1, 40, 0)"),
+        ];
+        assert_eq!(run_skewed(Some(vec!["transform"]), &tall_skewed), 0);
+        // A wrapper that only scales, even unequally, carries no move on y
+        // into x (review): the overflow stays.
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, "matrix(2, 0, 0, 1, 0, 0)"), 1);
+        // Under a perspective tilt (`perspective(500px) rotateX(30deg)`), a
+        // move on y shifts the text sideways on screen too (review).
+        let tilted = "matrix3d(1, 0, 0, 0, 0, 0.866025, 0.5, -0.001, 0, -0.5, 0.866025, -0.00173205, 0, 0, 0, 1)";
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, tilted), 0);
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, "matrix3d(2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)"), 1);
+        // A transform moved by script (a Web Animations loop) with no CSS
+        // animation or transition to trace it is unknown.
+        let untraced = [("transform", "matrix(1, 0, 0, 1, -40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &untraced, false), 1);
     }
 
     /// Taste call r4-p20 (observations-25 issue 8): text past the viewport

@@ -1552,7 +1552,7 @@ fn is_displaced(dom: &dyn Dom, el: ElId) -> bool {
 /// A box that [`is_displaced`] names and that is really moved: `translate:
 /// 0px`, `scale: 1` and `rotate: 0deg` move nothing, though they are not
 /// `none`.
-fn visibly_displaced(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn visibly_displaced(dom: &dyn Dom, el: ElId) -> bool {
     let transform = js::trim(&dom.style(el, "transform")).replace(' ', "");
     if !transform.is_empty() && transform != "none" && !is_identity_matrix(&transform) {
         return true;
@@ -3291,6 +3291,92 @@ pub fn check_element_radial_spotlight_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHi
     check_element_radial_spotlight_dom_with(dom, el, &GlowTextRects::default())
 }
 
+/// How much of `el`'s paint shows through the media laid over it: the
+/// product of `1 - opacity` over every later sibling `<video>` or `<img>`
+/// that covers its box (within a pixel), paints above it and shows a
+/// picture at capture. useforward.co's hero glow sits under a 0.7-opacity
+/// video, so 30% of it shows. A video counts only when it has a `poster`
+/// (an autoplay video with no poster paints nothing until a frame is
+/// decoded, and never where autoplay is blocked) and the capture saw a
+/// decoded frame (`readyState` 2 or more), since a poster that failed or is
+/// pending paints nothing either; an image when the capture
+/// saw it complete with a size of its own, and neither counts under a mask or
+/// a `clip-path`. Anything the capture cannot tell about leaves the glow as
+/// it is (1).
+fn share_left_by_covering_media(dom: &dyn Dom, el: ElId, rect: &Rect) -> f64 {
+    let Some(parent) = dom.parent(el) else { return 1.0 };
+    if !rect.all_finite() || rect.width <= 0.0 || rect.height <= 0.0 {
+        return 1.0;
+    }
+    let positioned = |e: ElId| !matches!(dom.style(e, "position").as_str(), "static" | "");
+    let z_auto = |e: ElId| matches!(dom.style(e, "zIndex").as_str(), "auto" | "");
+    if !z_auto(el) {
+        return 1.0;
+    }
+    let siblings = dom.children(parent);
+    let Some(at) = siblings.iter().position(|&c| c == el) else { return 1.0 };
+    let mut share = 1.0;
+    for &media in &siblings[at + 1..] {
+        let tag = tag_lower(dom, media);
+        let shows_picture = match tag.as_str() {
+            // A video paints nothing until a frame is decoded, or ever when
+            // autoplay is blocked or the source fails, and nothing says
+            // whether its poster loaded: a `readyState` of 2
+            // (`HAVE_CURRENT_DATA`) or more is the proof it paints a
+            // picture, the poster or, where that failed, the frame. The
+            // poster shows until playback starts, so it has to be one that
+            // cannot be transparent: the engine cannot see its alpha, and a
+            // PNG, SVG, WebP or GIF poster may be a texture the glow shows
+            // through.
+            "video" => {
+                dom.video_ready_state(media).is_some_and(|rs| rs >= 2)
+                    && dom.attr(media, "poster").is_some_and(|v| {
+                        !js::trim(&v).is_empty() && !crate::browser::text_layers::url_may_be_transparent(&v)
+                    })
+            }
+            "img" => {
+                let src = dom.image_current_src(media).or_else(|| dom.attr(media, "src")).unwrap_or_default();
+                dom.image_complete(media) == Some(true)
+                    && dom.image_natural_size(media).is_some_and(|(w, h)| w > 0.0 && h > 0.0)
+                    && !crate::browser::text_layers::url_may_be_transparent(&src)
+            }
+            _ => false,
+        };
+        if !shows_picture
+            || !z_auto(media)
+            || !(positioned(media) || !positioned(el))
+            || !crate::browser::painted::later_sibling_paints_after(dom, parent, el, media)
+        {
+            continue;
+        }
+        if !matches!(dom.style(media, "objectFit").as_str(), "cover" | "fill" | "") {
+            continue;
+        }
+        if !crate::browser::painted::painted_at_capture(dom, media) {
+            continue;
+        }
+        // A mask or clip-path can leave the glow showing where the box
+        // covers it (a full-size photo faded out by a `mask-image`).
+        if crate::browser::text_layers::masked_or_clipped(dom, media) {
+            continue;
+        }
+        let m = dom.rect(media);
+        let covers = m.all_finite()
+            && m.left <= rect.left + 1.0
+            && m.top <= rect.top + 1.0
+            && m.right >= rect.right - 1.0
+            && m.bottom >= rect.bottom - 1.0;
+        if !covers {
+            continue;
+        }
+        let opacity = parse_float(&dom.style(media, "opacity"));
+        if opacity.is_finite() {
+            share *= 1.0 - opacity.clamp(0.0, 1.0);
+        }
+    }
+    share
+}
+
 /// The declaration test of `checkRadialSpotlight`, then the prominence gate,
 /// reporting the stop that passed it.
 pub fn check_element_radial_spotlight_dom_with(
@@ -3308,7 +3394,7 @@ pub fn check_element_radial_spotlight_dom_with(
         return Vec::new();
     }
     let prominence = measures::RadialGlowProminence {
-        opacity: effective_opacity_dom(dom, el),
+        opacity: effective_opacity_dom(dom, el) * share_left_by_covering_media(dom, el, &rect),
         backdrop: glow_backdrop(dom, el, &gradient_value),
     };
     let Some(stop) = measures::radial_glow_prominent_stop(&stops, &prominence, || {
@@ -7195,6 +7281,143 @@ mod tests {
         assert!(check_element_radial_spotlight_dom(&d, glow).is_empty());
     }
 
+    /// useforward.co (322717): the hero's warm glow sits under an autoplay
+    /// video at `opacity: 0.7`, which leaves 30% of it showing.
+    #[test]
+    fn radial_spotlight_scales_by_the_media_laid_over_it() {
+        let run = |attrs: &[(&str, &str)], opacity: &str, width: f64| {
+            let (mut d, section, glow) =
+                dark_page_with_glow("radial-gradient(circle, rgba(171, 151, 116, 0.35) 0%, transparent 28%)");
+            let video = d.add(Some(section), "video");
+            d.el_mut(video).video_ready_state = Some(4);
+            for (k, v) in attrs {
+                d.set_attr(video, k, v);
+            }
+            d.set_styles(video, &[("position", "absolute"), ("opacity", opacity), ("objectFit", "cover")]);
+            d.set_rect(video, 0.0, 0.0, width, 502.0);
+            check_element_radial_spotlight_dom(&d, glow)
+        };
+        let poster = [("poster", "/images/poster.jpg")];
+        assert!(run(&poster, "0.7", 803.0).is_empty());
+        // An autoplay video with no poster may paint nothing at all.
+        let autoplay = [("autoplay", ""), ("src", "/videos/hero.mp4")];
+        assert_eq!(run(&autoplay, "0.7", 803.0).len(), 1);
+        // A fainter video leaves the glow bright enough.
+        assert_eq!(run(&poster, "0.3", 803.0).len(), 1);
+        // A video that may show nothing, one that covers part of the glow,
+        // and an opacity the capture did not record leave it as it was.
+        assert_eq!(run(&[], "0.7", 803.0).len(), 1);
+        assert_eq!(run(&[("src", "/videos/hero.mp4")], "0.7", 803.0).len(), 1);
+        assert_eq!(run(&poster, "0.7", 400.0).len(), 1);
+        assert_eq!(run(&poster, "", 803.0).len(), 1);
+    }
+
+    /// A flex or grid container paints its items in `order`: a video later
+    /// in the source with a lower `order` paints under the glow.
+    #[test]
+    fn radial_spotlight_media_cover_follows_css_order() {
+        let run = |section_display: &str, glow_order: &str, video_order: &str| {
+            let (mut d, section, glow) =
+                dark_page_with_glow("radial-gradient(circle, rgba(171, 151, 116, 0.35) 0%, transparent 28%)");
+            d.set_style(section, "display", section_display);
+            d.set_styles(glow, &[("position", "relative"), ("order", glow_order)]);
+            let video = d.add(Some(section), "video");
+            d.el_mut(video).video_ready_state = Some(4);
+            d.set_attr(video, "poster", "/images/poster.jpg");
+            d.set_styles(video, &[("position", "relative"), ("opacity", "0.7"), ("objectFit", "cover"), ("order", video_order)]);
+            d.set_rect(video, 0.0, 0.0, 803.0, 502.0);
+            check_element_radial_spotlight_dom(&d, glow).len()
+        };
+        assert_eq!(run("flex", "0", "0"), 0);
+        assert_eq!(run("grid", "1", "2"), 0);
+        // Ordered first, the video paints under the glow.
+        assert_eq!(run("flex", "2", "1"), 1);
+        // An `order` the capture did not record is unknown.
+        assert_eq!(run("flex", "0", ""), 1);
+        // A block container paints in tree order.
+        assert_eq!(run("block", "2", "1"), 0);
+    }
+
+    /// A loaded image over the glow covers it unless it may be a
+    /// transparent texture: a PNG or SVG.
+    #[test]
+    fn radial_spotlight_sees_through_a_png_or_svg_texture() {
+        let run = |src: &str| {
+            let (mut d, section, glow) =
+                dark_page_with_glow("radial-gradient(circle, rgba(171, 151, 116, 0.35) 0%, transparent 28%)");
+            let img = d.add(Some(section), "img");
+            d.set_attr(img, "src", src);
+            d.el_mut(img).image_complete = Some(true);
+            d.el_mut(img).image_natural_size = Some((1600.0, 1000.0));
+            d.set_styles(img, &[("position", "absolute"), ("opacity", "1"), ("objectFit", "cover")]);
+            d.set_rect(img, 0.0, 0.0, 803.0, 502.0);
+            check_element_radial_spotlight_dom(&d, glow).len()
+        };
+        assert_eq!(run("/images/hero.jpg"), 0);
+        assert_eq!(run("/images/grain.png?v=3"), 1);
+        assert_eq!(run("/images/noise.svg"), 1);
+    }
+
+    /// Review: a video poster gets the same PNG / SVG exclusion as an image,
+    /// since a transparent poster leaves the glow showing.
+    #[test]
+    fn radial_spotlight_sees_through_a_png_or_svg_poster() {
+        let run_state = |poster: &str, ready_state: Option<u8>| {
+            let (mut d, section, glow) =
+                dark_page_with_glow("radial-gradient(circle, rgba(171, 151, 116, 0.35) 0%, transparent 28%)");
+            let video = d.add(Some(section), "video");
+            d.el_mut(video).video_ready_state = ready_state;
+            d.set_attr(video, "poster", poster);
+            d.set_styles(video, &[("position", "absolute"), ("opacity", "1"), ("objectFit", "cover")]);
+            d.set_rect(video, 0.0, 0.0, 803.0, 502.0);
+            check_element_radial_spotlight_dom(&d, glow).len()
+        };
+        let run = |poster: &str| run_state(poster, Some(4));
+        assert_eq!(run("/images/poster.jpg"), 0);
+        assert_eq!(run("/images/poster.PNG?v=2"), 1);
+        assert_eq!(run("/images/poster.svg#frame"), 1);
+        // Review: WebP, GIF and AVIF carry alpha too, as do the same
+        // formats in a data URI, and a URL naming no format is unknown.
+        assert_eq!(run("/images/poster.webp"), 1);
+        assert_eq!(run("/images/poster.GIF"), 1);
+        assert_eq!(run("/images/poster.avif?w=1600"), 1);
+        assert_eq!(run("data:image/png;base64,iVBORw0KGgo="), 1);
+        assert_eq!(run("data:image/svg+xml,%3Csvg%3E%3C/svg%3E"), 1);
+        assert_eq!(run("data:image/webp;base64,UklGRg=="), 1);
+        assert_eq!(run("https://cdn.example.com/media/hero?w=1600"), 1);
+        assert_eq!(run("data:image/jpeg;base64,/9j/4AAQ"), 0);
+        assert_eq!(run("/images/poster.JPEG#t=1"), 0);
+        // Review: a poster that failed or is still loading paints nothing,
+        // and nothing says which; only a decoded frame (`readyState` 2 or
+        // more) proves the video shows a picture.
+        assert_eq!(run_state("/images/poster.jpg", Some(1)), 1);
+        assert_eq!(run_state("/images/poster.jpg", Some(0)), 1);
+        assert_eq!(run_state("/images/poster.jpg", None), 1);
+        assert_eq!(run_state("/images/poster.jpg", Some(2)), 0);
+    }
+
+    /// Review: a full-size photo faded out by a `mask-image`, or cut by a
+    /// `clip-path`, covers the glow with its box but not with its paint.
+    #[test]
+    fn radial_spotlight_sees_past_a_masked_or_clipped_photo() {
+        let run = |styles: &[(&str, &str)]| {
+            let (mut d, section, glow) =
+                dark_page_with_glow("radial-gradient(circle, rgba(171, 151, 116, 0.35) 0%, transparent 28%)");
+            let img = d.add(Some(section), "img");
+            d.set_attr(img, "src", "/images/hero.jpg");
+            d.el_mut(img).image_complete = Some(true);
+            d.el_mut(img).image_natural_size = Some((1600.0, 1000.0));
+            d.set_styles(img, &[("position", "absolute"), ("opacity", "1"), ("objectFit", "cover")]);
+            d.set_styles(img, styles);
+            d.set_rect(img, 0.0, 0.0, 803.0, 502.0);
+            check_element_radial_spotlight_dom(&d, glow).len()
+        };
+        assert_eq!(run(&[("maskImage", "none"), ("clipPath", "none")]), 0);
+        assert_eq!(run(&[("maskImage", "linear-gradient(black, transparent)")]), 1);
+        assert_eq!(run(&[("webkitMaskImage", "linear-gradient(black, transparent)")]), 1);
+        assert_eq!(run(&[("clipPath", "inset(0px 50% 0px 0px)")]), 1);
+    }
+
     #[test]
     fn radial_spotlight_measures_a_hero_painted_with_a_gradient() {
         // The commonest way to build this pattern: a glow layer over a hero
@@ -8893,6 +9116,149 @@ mod tests {
         d.set_style(img, "zIndex", "10");
         assert!(!reports_contrast(&colors(&d, text)), "{:?}", colors(&d, text));
         assert!(!reports_contrast(&colors(&d, initial)), "{:?}", colors(&d, initial));
+    }
+
+    /// thingstohave.app (323632): avatar initials below the fold, under the
+    /// loaded photo the next sibling lays over them. No point is asked down
+    /// there, so the tree says it.
+    #[test]
+    fn a_loaded_photo_over_initials_below_the_fold_leaves_them_unscored() {
+        let run_src = |complete: Option<bool>, top: f64, img_width: f64, src: &str| {
+            let (mut d, body) = page();
+            let avatar = bare_box(&mut d, body, "div", (665.0, top, 35.0, 35.0));
+            d.set_style(avatar, "position", "relative");
+            let initial = faint_copy(&mut d, avatar, "rgb(220, 220, 220)", (670.0, top + 8.0, 20.0, 18.0));
+            d.set_styles(initial, &[("position", "absolute"), ("zIndex", "auto")]);
+            let wrap = bare_box(&mut d, avatar, "div", (665.0, top, 35.0, 35.0));
+            d.set_styles(wrap, &[("position", "absolute"), ("zIndex", "auto"), ("opacity", "1")]);
+            let img = bare_box(&mut d, wrap, "img", (665.0, top, img_width, 35.0));
+            d.set_styles(img, &[("opacity", "1"), ("objectFit", "cover")]);
+            d.el_mut(img).image_complete = complete;
+            d.el_mut(img).image_natural_size = Some((96.0, 96.0));
+            d.set_attr(img, "src", src);
+            colors(&d, initial)
+        };
+        let run = |complete: Option<bool>, top: f64, img_width: f64| {
+            run_src(complete, top, img_width, "/avatars/sophia.jpg")
+        };
+        assert!(!reports_contrast(&run(Some(true), 1334.0, 35.0)));
+        // A PNG or SVG may be transparent.
+        assert!(reports_contrast(&run_src(Some(true), 1334.0, 35.0, "/avatars/sophia.png?v=2")));
+        assert!(reports_contrast(&run_src(Some(true), 1334.0, 35.0, "/avatars/sophia.svg")));
+        // Review: so may a WebP, a PNG data URI, or a URL naming no format.
+        assert!(reports_contrast(&run_src(Some(true), 1334.0, 35.0, "/avatars/sophia.webp")));
+        assert!(reports_contrast(&run_src(Some(true), 1334.0, 35.0, "data:image/png;base64,iVBORw0KGgo=")));
+        assert!(reports_contrast(&run_src(Some(true), 1334.0, 35.0, "https://cdn.example.com/u/42?s=96")));
+        // A photo still loading, or not recorded, or covering only part of
+        // the initials, leaves the verdict.
+        assert!(reports_contrast(&run(Some(false), 1334.0, 35.0)));
+        assert!(reports_contrast(&run(None, 1334.0, 35.0)));
+        assert!(reports_contrast(&run(Some(true), 1334.0, 12.0)));
+    }
+
+    /// Review: a photo masked or clipped over the initials may leave them
+    /// showing, so its box covering them is no proof its paint does.
+    #[test]
+    fn a_masked_or_clipped_photo_over_initials_leaves_their_verdict() {
+        let run = |on_wrap: bool, styles: &[(&str, &str)]| {
+            let (mut d, body) = page();
+            let top = 1334.0;
+            let avatar = bare_box(&mut d, body, "div", (665.0, top, 35.0, 35.0));
+            d.set_style(avatar, "position", "relative");
+            let initial = faint_copy(&mut d, avatar, "rgb(220, 220, 220)", (670.0, top + 8.0, 20.0, 18.0));
+            d.set_styles(initial, &[("position", "absolute"), ("zIndex", "auto")]);
+            let wrap = bare_box(&mut d, avatar, "div", (665.0, top, 35.0, 35.0));
+            d.set_styles(wrap, &[("position", "absolute"), ("zIndex", "auto"), ("opacity", "1")]);
+            let img = bare_box(&mut d, wrap, "img", (665.0, top, 35.0, 35.0));
+            d.set_styles(img, &[("opacity", "1"), ("objectFit", "cover")]);
+            d.set_styles(if on_wrap { wrap } else { img }, styles);
+            d.el_mut(img).image_complete = Some(true);
+            d.el_mut(img).image_natural_size = Some((96.0, 96.0));
+            d.set_attr(img, "src", "/avatars/sophia.jpg");
+            reports_contrast(&colors(&d, initial))
+        };
+        assert!(!run(false, &[("maskImage", "none"), ("clipPath", "none")]));
+        assert!(run(false, &[("maskImage", "linear-gradient(black, transparent)")]));
+        assert!(run(true, &[("webkitMaskImage", "radial-gradient(black, transparent)")]));
+        assert!(run(false, &[("clipPath", "inset(0px 0px 0px 60%)")]));
+    }
+
+    /// Review: a wrapper with `overflow: hidden` narrower than the photo
+    /// shows only part of it, and initials outside that part stay visible.
+    #[test]
+    fn a_photo_cut_by_a_narrow_overflow_wrapper_leaves_the_initials_verdict() {
+        let run = |wrap_width: f64, overflow: &str| {
+            let (mut d, body) = page();
+            let top = 1334.0;
+            let avatar = bare_box(&mut d, body, "div", (665.0, top, 35.0, 35.0));
+            d.set_style(avatar, "position", "relative");
+            let initial = faint_copy(&mut d, avatar, "rgb(220, 220, 220)", (670.0, top + 8.0, 20.0, 18.0));
+            d.set_styles(initial, &[("position", "absolute"), ("zIndex", "auto")]);
+            let wrap = bare_box(&mut d, avatar, "div", (665.0, top, wrap_width, 35.0));
+            d.set_styles(
+                wrap,
+                &[("position", "absolute"), ("zIndex", "auto"), ("opacity", "1"), ("overflow", overflow), ("overflowX", overflow), ("overflowY", overflow)],
+            );
+            let img = bare_box(&mut d, wrap, "img", (665.0, top, 35.0, 35.0));
+            d.set_styles(img, &[("opacity", "1"), ("objectFit", "cover")]);
+            d.el_mut(img).image_complete = Some(true);
+            d.el_mut(img).image_natural_size = Some((96.0, 96.0));
+            d.set_attr(img, "src", "/avatars/sophia.jpg");
+            reports_contrast(&colors(&d, initial))
+        };
+        assert!(!run(35.0, "hidden"));
+        assert!(!run(12.0, "visible"));
+        assert!(run(12.0, "hidden"));
+        assert!(run(12.0, "clip"));
+    }
+
+    /// In a flex avatar whose photo wrapper is an in-flow item, CSS `order`
+    /// decides whether the photo paints over the initials.
+    #[test]
+    fn a_photo_ordered_before_the_initials_does_not_cover_them() {
+        let run_z = |initial_order: &str, wrap_order: &str, img_z: &str| {
+            let (mut d, body) = page();
+            let top = 1334.0;
+            let avatar = bare_box(&mut d, body, "div", (665.0, top, 35.0, 35.0));
+            d.set_styles(avatar, &[("position", "relative"), ("display", "flex")]);
+            let initial = faint_copy(&mut d, avatar, "rgb(220, 220, 220)", (670.0, top + 8.0, 20.0, 18.0));
+            d.set_styles(initial, &[("position", "relative"), ("zIndex", "auto"), ("order", initial_order)]);
+            let wrap = bare_box(&mut d, avatar, "div", (665.0, top, 35.0, 35.0));
+            d.set_styles(wrap, &[("position", "relative"), ("zIndex", "auto"), ("opacity", "1"), ("order", wrap_order)]);
+            let img = bare_box(&mut d, wrap, "img", (665.0, top, 35.0, 35.0));
+            d.set_styles(img, &[("opacity", "1"), ("objectFit", "cover"), ("zIndex", img_z)]);
+            d.el_mut(img).image_complete = Some(true);
+            d.el_mut(img).image_natural_size = Some((96.0, 96.0));
+            d.set_attr(img, "src", "/avatars/sophia.jpg");
+            reports_contrast(&colors(&d, initial))
+        };
+        let run = |initial_order: &str, wrap_order: &str| run_z(initial_order, wrap_order, "auto");
+        assert!(!run("0", "0"));
+        // A photo at `z-index: -1` paints behind the initials.
+        assert!(run_z("0", "0", "-1"));
+        assert!(run("1", "0"));
+        assert!(run("0", ""));
+    }
+
+    /// A transparent grain overlay laid over a section below the fold: the
+    /// engine cannot see its alpha, and it is no avatar, so the muted copy
+    /// under it keeps its verdict.
+    #[test]
+    fn a_grain_overlay_below_the_fold_does_not_cover_the_text() {
+        let run = |src: &str| {
+            let (mut d, body) = page();
+            let section = bare_box(&mut d, body, "section", (0.0, 1400.0, 1280.0, 400.0));
+            d.set_style(section, "position", "relative");
+            let p = faint_copy(&mut d, section, "rgb(220, 220, 220)", (40.0, 1500.0, 600.0, 28.0));
+            let grain = bare_box(&mut d, section, "img", (0.0, 1400.0, 1280.0, 400.0));
+            d.set_styles(grain, &[("position", "absolute"), ("zIndex", "auto"), ("opacity", "1"), ("objectFit", "cover")]);
+            d.set_attr(grain, "src", src);
+            d.el_mut(grain).image_complete = Some(true);
+            d.el_mut(grain).image_natural_size = Some((512.0, 512.0));
+            colors(&d, p)
+        };
+        assert!(reports_contrast(&run("/textures/grain.png")));
+        assert!(reports_contrast(&run("/textures/grain.webp")));
     }
 
     #[test]
