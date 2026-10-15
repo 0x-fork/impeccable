@@ -31,7 +31,7 @@ use impeccable_core::browser::{BrowserConfig, ElId};
 use impeccable_core::color::Rgba;
 use serde_json::{json, Value};
 
-use crate::cdp::{CdpError, CdpResult, Page};
+use crate::cdp::{CdpError, CdpResult, Page, NATIVES_JS};
 
 /// `browser-bundle/15-snapshot.js` — the page-measurement producer. It defines
 /// `const __impeccableSnapshot = {...}` plus its helpers; [`ensure_snapshot_js`]
@@ -39,9 +39,12 @@ use crate::cdp::{CdpError, CdpResult, Page};
 const SNAPSHOT_JS: &str = include_str!("../../../browser-bundle/15-snapshot.js");
 
 /// Install `window.__impeccableSnapshot` from [`SNAPSHOT_JS`] (idempotent).
+/// [`NATIVES_JS`] goes first in the same function, so the producer reaches
+/// the built-ins the new-document prelude stashed before the page's scripts
+/// ran, not whatever the page left on `window` (a site's own global `Map`).
 pub fn ensure_snapshot_js(page: &mut Page<'_>) -> CdpResult<()> {
     let expr = format!(
-        "(function(){{ if (window.__impeccableSnapshot) return true;\n{SNAPSHOT_JS}\nwindow.__impeccableSnapshot = __impeccableSnapshot; return true; }})()"
+        "(function(){{ if (window.__impeccableSnapshot) return true;\n{NATIVES_JS}\n{SNAPSHOT_JS}\nwindow.__impeccableSnapshot = __impeccableSnapshot; return true; }})()"
     );
     page.evaluate_value(&expr)?;
     Ok(())

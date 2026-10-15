@@ -231,8 +231,8 @@ function __snapConditionalCssRuleIsActive(rule) {
   const constructorName = rule?.constructor?.name || '';
   if (constructorName === 'CSSMediaRule' || type === 4) {
     const condition = rule.conditionText || rule.media?.mediaText || '';
-    if (!condition || typeof window.matchMedia !== 'function') return true;
-    try { return window.matchMedia(condition).matches; }
+    if (!condition || typeof matchMedia !== 'function') return true;
+    try { return matchMedia(condition).matches; }
     catch { return true; }
   }
   if (constructorName === 'CSSSupportsRule' || type === 12) {

@@ -727,6 +727,10 @@ impl<'a> Page<'a> {
             self.handle_frame_tree(ft, None);
         }
         self.send("Page.setLifecycleEventsEnabled", json!({ "enabled": true }))?;
+        // Before any page script on every document this page loads: keep the
+        // built-ins the snapshot producer uses where page script cannot
+        // replace them (`natives_prelude_script`).
+        self.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": natives_prelude_script() }))?;
         // URL mode injects only the snapshot producer (plain JS) and runs the
         // rules natively in this process over `SnapshotDom` (triage D2; see
         // WASM-BUNDLE.md in the detector repo): no WebAssembly is compiled next
@@ -1418,6 +1422,16 @@ impl<'a> Page<'a> {
         expression: &str,
         unique_context: Option<&str>,
     ) -> CdpResult<EvalOutcome> {
+        // The main world is the page's: run the expression with the
+        // built-ins the prelude stashed (`in_natives_scope`). An isolated
+        // world has its own untouched globals.
+        let scoped;
+        let expression = if unique_context.is_none() {
+            scoped = in_natives_scope(expression);
+            scoped.as_str()
+        } else {
+            expression
+        };
         let mut params = json!({"expression":expression,"returnByValue":true,"awaitPromise":true,"userGesture":true});
         if let Some(id) = unique_context {
             params["uniqueContextId"] = json!(id);
@@ -2263,6 +2277,54 @@ mod tests {
     }
 }
 
+/// `browser-bundle/05-natives.js`: binds the built-ins the page JS uses
+/// (`Map`, `Set`, `Array.from`, `JSON.stringify`, ...) from
+/// `window.__impeccableNatives` when that stash exists, else from the
+/// current globals.
+pub const NATIVES_JS: &str = include_str!("../../../browser-bundle/05-natives.js");
+
+/// The new-document script [`Page`] registers for every document, which runs
+/// before the page's own scripts: it builds the natives from the untouched
+/// globals and stashes them on `window.__impeccableNatives`, non-enumerable
+/// and read-only, so a page that declares its own global `Map` (work24.go.kr)
+/// or reassigns `Array.from` cannot reach the capture.
+pub fn natives_prelude_script() -> String {
+    format!(
+        "(function(){{\n{NATIVES_JS}\ntry {{ Reflect.defineProperty(window, '__impeccableNatives', {{ value: __impeccableNatives, enumerable: false, writable: false, configurable: false }}); }} catch (e) {{}}\n}})()"
+    )
+}
+
+/// The names `browser-bundle/05-natives.js` binds, in its order. A unit test
+/// keeps the two lists equal.
+pub const NATIVE_NAMES: &[&str] = &[
+    "Map", "Set", "WeakMap", "WeakSet", "Error", "URL", "Image", "ResizeObserver", "String",
+    "Boolean", "Array", "Object", "Number", "Promise", "JSON", "Math", "Reflect", "CSS",
+    "performance", "getComputedStyle", "matchMedia", "setTimeout", "clearTimeout",
+    "requestAnimationFrame", "parseFloat",
+];
+
+/// `expression` inside a block whose `const`s shadow the built-ins with the
+/// ones the new-document prelude stashed, so the engine's own page scripts
+/// (the scroll probe, the full-page screenshot, consent and overlay
+/// handling) build a native `Map` on a page that declared its own
+/// (work24.go.kr). Without a stash (a document loaded before the prelude was
+/// registered) the names read the page's globals as before.
+///
+/// A block's completion value is its last statement's, so an expression and
+/// a statement list ending in one both return what they did unwrapped. The
+/// prefix shares the expression's first line, so reported line numbers do
+/// not move, and the closing brace has its own line, so a trailing `//`
+/// comment cannot swallow it.
+pub fn in_natives_scope(expression: &str) -> String {
+    let mut out = String::with_capacity(expression.len() + 320);
+    out.push_str("{ const { ");
+    out.push_str(&NATIVE_NAMES.join(", "));
+    out.push_str(" } = (window.__impeccableNatives || window); ");
+    out.push_str(expression);
+    out.push_str("\n}");
+    out
+}
+
 /// The page-side half of [`Page::pin_clock`].
 pub fn pinned_clock_script(epoch_ms: f64) -> String {
     format!(r#"(()=>{{const T={epoch},P=performance.now(),N=Date;const now=()=>Math.floor(T+performance.now()-P);
@@ -2272,4 +2334,29 @@ Object.defineProperty(N.prototype,"constructor",{{value:D,writable:true,configur
 const F=Intl.DateTimeFormat.prototype,g=Object.getOwnPropertyDescriptor(F,"format").get,p=F.formatToParts;
 Object.defineProperty(F,"format",{{configurable:true,get(){{const f=g.call(this);return d=>f(d===undefined?now():d)}}}});
 F.formatToParts=function(d){{return p.call(this,d===undefined?now():d)}};}})()"#, epoch = epoch_ms.floor() as i64)
+}
+
+#[cfg(test)]
+mod natives_tests {
+    use super::*;
+
+    #[test]
+    fn native_names_match_the_natives_file() {
+        let start = NATIVES_JS.rfind("const {").expect("05-natives.js ends with a destructure");
+        let end = start + NATIVES_JS[start..].find('}').expect("closing brace");
+        let names: Vec<&str> = NATIVES_JS[start + "const {".len()..end]
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(names, NATIVE_NAMES, "browser-bundle/05-natives.js and NATIVE_NAMES differ");
+    }
+
+    #[test]
+    fn natives_scope_keeps_the_first_line_and_closes_after_a_comment() {
+        let scoped = in_natives_scope("(() => 1)() // trailing");
+        assert_eq!(scoped.lines().count(), 2);
+        assert!(scoped.lines().next().unwrap().ends_with("(() => 1)() // trailing"));
+        assert_eq!(scoped.lines().last(), Some("}"));
+    }
 }
