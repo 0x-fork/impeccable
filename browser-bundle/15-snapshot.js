@@ -38,7 +38,7 @@ const __SNAP_STYLE_PROPS = [
   "marginRight", "marginTop", "maskImage", "maxHeight", "maxWidth", "minHeight", "minWidth",
   "mixBlendMode", "objectFit", "objectPosition", "opacity", "order", "outline",
   "outlineColor", "outlineOffset", "outlineStyle", "outlineWidth", "overflow",
-  "overflowX", "overflowY", "paddingBottom", "paddingLeft", "paddingRight",
+  "overflowClipMargin", "overflowX", "overflowY", "paddingBottom", "paddingLeft", "paddingRight",
   "paddingTop", "perspective", "pointerEvents", "position", "right", "rotate",
   "scale", "textAlign",
   "textDecoration", "textDecorationLine", "textIndent", "textOverflow",
@@ -55,7 +55,7 @@ const __SNAP_PSEUDO_PROPS = [
   "content", "position", "opacity", "display", "width", "height", "top",
   "right", "bottom", "left", "backgroundColor", "backgroundImage",
   "background", "borderRadius", "transform", "visibility", "zIndex",
-  "translate", "scale", "rotate", "filter",
+  "translate", "scale", "rotate", "filter", "fontSize",
 ];
 // Pseudo-class states recorded per element (`el.matches(':name')`), so the
 // snapshot selector engine can answer `:checked` / `:disabled` / ... the way

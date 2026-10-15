@@ -154,6 +154,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "outlineStyle",
     "outlineWidth",
     "overflow",
+    "overflowClipMargin",
     "overflowX",
     "overflowY",
     "paddingBottom",
@@ -223,6 +224,7 @@ pub const PSEUDO_PROPS: &[&str] = &[
     "scale",
     "rotate",
     "filter",
+    "fontSize",
 ];
 
 /// One child of an element: an element (by id) or a text node's data.
