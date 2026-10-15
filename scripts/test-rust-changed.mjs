@@ -21,9 +21,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { selectCrates } from './lib/rust-test-selection.mjs';
 
 const ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const WORKSPACE_FILES = [/^Cargo\.(toml|lock)$/, /^rust-toolchain(\.toml)?$/, /^\.cargo\//];
 
 const argv = process.argv.slice(2);
 const dashDash = argv.indexOf('--');
@@ -39,7 +39,9 @@ if (!base) fail('--base needs a ref');
 const printOnly = own.includes('--print');
 
 const git = (args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
-const lines = (text) => text.split(/\r?\n/).filter(Boolean);
+// NUL-separated output keeps paths verbatim: without -z git quotes and
+// escapes a name such as `café.html`, which then matches no crate.
+const paths = (text) => text.split('\0').filter(Boolean);
 
 let mergeBase;
 try {
@@ -50,8 +52,8 @@ try {
 const changed = [...new Set([
   // --no-renames lists both sides of a move, so a file moved out of a crate
   // still selects the crate it left.
-  ...lines(git(['diff', '--name-only', '--no-renames', mergeBase])),
-  ...lines(git(['ls-files', '--others', '--exclude-standard'])),
+  ...paths(git(['diff', '--name-only', '--no-renames', '-z', mergeBase])),
+  ...paths(git(['ls-files', '--others', '--exclude-standard', '-z'])),
 ])];
 
 const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps'], {
@@ -62,69 +64,16 @@ const packages = metadata.packages.map((p) => ({
   dir: path.relative(ROOT, path.dirname(p.manifest_path)).split(path.sep).join('/'),
   deps: p.dependencies.filter((d) => d.path).map((d) => d.name),
 }));
-const byDir = new Map(packages.map((p) => [p.dir, p.name]));
 
-const whole = changed.filter((f) => WORKSPACE_FILES.some((re) => re.test(f)));
-const selected = new Set();
-const reasons = new Map();
-const pick = (name, why) => {
-  if (!selected.has(name)) reasons.set(name, why);
-  selected.add(name);
-};
-
-const external = [];
-for (const file of changed) {
-  const m = /^(crates\/[^/]+)\//.exec(file);
-  if (m) {
-    const name = byDir.get(m[1]);
-    if (name) pick(name, file);
-  } else if (!whole.includes(file)) {
-    external.push(file);
-  }
-}
-for (const file of external) {
-  // Crates name what they read either relative to their manifest
-  // (`include_str!("../../../skill/scripts/live-browser.js")`, a
-  // `CARGO_MANIFEST_DIR/../../browser-bundle` dir) or from the repo root
-  // (`repo_root().join("tests/fixtures/antipatterns/x.html")`). Search for the
-  // file itself, a manifest-relative read of a directory above it
-  // (`../<dir>"`), and a repo-relative path under a directory at least two
-  // levels deep (`tests/fixtures/antipatterns/`). A crate that includes one
-  // file of scripts/ or merely mentions `package.json` is not selected by
-  // every edit there.
-  const parts = file.split('/');
-  const terms = new Set([`../${file}`]);
-  if (parts.length > 2) terms.add(file);
-  for (let i = parts.length - 1; i >= 1; i--) {
-    const dir = parts.slice(0, i).join('/');
-    terms.add(`../${dir}"`);
-    if (i >= 2) terms.add(`${dir}/`);
-  }
-  let hits = '';
+const searchCrates = (terms) => {
   try {
-    hits = git(['grep', '-l', '-F', ...[...terms].flatMap((t) => ['-e', t]), '--', 'crates']);
-  } catch {
-    continue; // git grep exits 1 when nothing matches
+    return paths(git(['grep', '-l', '-z', '-F', ...terms.flatMap((t) => ['-e', t]), '--', 'crates']));
+  } catch (error) {
+    if (error.status === 1) return []; // git grep exits 1 when nothing matches
+    throw error;
   }
-  for (const hit of lines(hits)) {
-    const name = byDir.get(hit.split('/').slice(0, 2).join('/'));
-    if (name) pick(name, file);
-  }
-}
-
-// Reverse dependencies: anything in the workspace that depends on a selected
-// crate is selected too.
-for (let grew = true; grew;) {
-  grew = false;
-  for (const p of packages) {
-    if (selected.has(p.name)) continue;
-    const dep = p.deps.find((d) => selected.has(d));
-    if (dep) {
-      pick(p.name, `depends on ${dep}`);
-      grew = true;
-    }
-  }
-}
+};
+const { whole, selected } = selectCrates({ changed, packages, searchCrates });
 
 if (whole.length) {
   console.log(`Whole workspace: ${whole.join(', ')} changed against ${base}.`);
@@ -133,10 +82,10 @@ if (whole.length) {
   process.exit(0);
 } else {
   console.log(`${selected.size} of ${packages.length} crates against ${base}:`);
-  for (const name of [...selected].sort()) console.log(`  ${name}  (${reasons.get(name)})`);
+  for (const name of [...selected.keys()].sort()) console.log(`  ${name}  (${selected.get(name)})`);
 }
 
-const cargoArgs = ['test', ...(whole.length ? ['--workspace'] : [...selected].sort().flatMap((n) => ['-p', n])), '--no-fail-fast', ...passthrough];
+const cargoArgs = ['test', ...(whole.length ? ['--workspace'] : [...selected.keys()].sort().flatMap((n) => ['-p', n])), '--no-fail-fast', ...passthrough];
 console.log(`cargo ${cargoArgs.join(' ')}`);
 if (printOnly) process.exit(0);
 
@@ -167,7 +116,8 @@ child.on('close', (code, signal) => {
   console.log(`${status}: ${passed} passed, ${failed} failed in ${secs}s`);
   for (const name of failures) console.log(`  FAILED ${name}`);
   if (code !== 0 && !failures.length) console.log(`  see the log for the error: ${logPath}`);
-  process.exit(code ?? 1);
+  // exitCode rather than exit(): the log stream may still be flushing.
+  process.exitCode = code ?? 1;
 });
 
 function fail(message) {
