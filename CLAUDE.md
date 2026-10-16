@@ -194,6 +194,7 @@ The default suite does not cover everything. When a change touches one of these 
 | `ENGINE_VERSION` bump | also `bun run test:live-e2e-accept-cleanup` | bills a provider API key |
 | `ENGINE_VERSION` bump | `bun run test:live-svelte-adapter-deepseek` | bills DeepSeek |
 | `SKILL.src.md` Setup, Setup-adjacent reference files, `ENGINE_VERSION` bump | `bun run test:skill-behavior` | ~5 min, bills all four provider keys |
+| The skill's frontmatter `description` in `SKILL.src.md` | `bun run test:skill-activation` | ~3 min, about $1 (Anthropic + Google keys); baseline in `tests/skill-behavior/README.md` |
 | `ENGINE_VERSION` bump | `bun run test:new-work-e2e` | Playwright, offline, no API cost |
 | `plugin/`, `skill/agents/`, `scripts/build.js`, plugin manifest validator | `bun run test:plugin-e2e` | ~1 s; already in the default suite, needs the `claude` CLI |
 
