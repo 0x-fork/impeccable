@@ -105,6 +105,8 @@ Notation: `stdout>` / `stderr>` are literal writes; `exit N`; template strings u
 | `--no-design-system` | `designSystemEnabled = configEnabled && !flag && detectionConfig.designSystem?.enabled !== false` |
 | `--scope <v>` / `--scope=<v>` | comma-split, trimmed, filtered; repeated occurrences accumulate; the flag+value are spliced out of `args`. Value missing or starting with `--` → `stderr> Error: --scope requires a value. Valid scopes: ${[...RULE_SCOPES].join(', ')}\n`, `exit 1`. Unknown → `stderr> Error: unknown --scope value(s): ${unknown.join(', ')}. Valid scopes: ...\n`, `exit 1`. `RULE_SCOPES` = union of rules' `scopes` = `type`, `layout` (in insertion order: `type` first from `overused-font`, then `layout` from `nested-cards`). |
 | `--viewport <WxH>` / `--viewport=WxH` | regex `/^(\d{2,5})x(\d{2,5})$/i`; failure → `stderr> Error: --viewport requires a WxH value, e.g. --viewport 390x844\n`, `exit 1`. Sets `baseScanOptions.viewport = {width,height}` (browser scans only). Spliced out. |
+| `--cdp <v>` / `--cdp=<v>` | Rust engine only. Scan a page of a running Chromium-based app through its DevTools endpoint instead of any target (see **Attached pages** below). Spliced out with its value (the last one given wins). Value missing (end of args, or the next arg starts with `--`) → `stderr> Error: --cdp requires a DevTools port or URL, e.g. --cdp 9222 or --cdp ws://127.0.0.1:9222/devtools/browser/<id>\n`, `exit 1`. Accepted values: a port (`9222`, host `127.0.0.1`), `host:port`, `[v6]:port`, `http://host:port[/]`, `ws://host:port[/]`, `ws://host:port/devtools/browser/<id>`, `ws://host:port/devtools/page/<id>` (that page is the target). A host that is not `localhost` or a loopback address → `stderr> Error: --cdp only attaches to a DevTools port on this machine (127.0.0.1, localhost or [::1]), not <host>\n`; a port outside 1 to 65535 → `stderr> Error: --cdp port must be between 1 and 65535; got <v>\n`; another scheme → `stderr> Error: --cdp takes a port, host:port, http:// or ws:// URL; got <v>\n`; another path → `stderr> Error: --cdp expects a DevTools port or a ws://.../devtools/browser/<id> or .../devtools/page/<id> URL; got <v>\n`; each `exit 1`. With `--viewport` → `stderr> Error: --viewport does not apply with --cdp: the attached window keeps its own size\n`, `exit 1`. With positional targets (checked after `--help`) → `stderr> Error: --cdp scans the page of a running app and takes no file or URL targets\n`, `exit 1`. Stdin is never read under `--cdp`. |
+| `--target <s>` / `--target=<s>` | With `--cdp`: picks the page (below). Spliced out with its value. Missing or blank value → `stderr> Error: --target requires a substring of the page's URL or title, e.g. --target localhost:5173\n`, `exit 1`. Without `--cdp` → `stderr> Error: --target picks a page of the app --cdp attaches to; pass --cdp <port> with it\n`, `exit 1`. |
 | positional | `targets = args.filter(a => !a.startsWith('--'))` (so a bare `-x` single-dash arg is a *target*, except `-json`/`-fast` which were rewritten) |
 
 **Usage text** (`printUsage`, stdout, verbatim):
@@ -131,6 +133,13 @@ Options:
   --no-overlay-hiding URL scans: keep product tours (driver.js) and
                       preloaders still covering the page instead of hiding
                       them before the scan
+  --cdp <port|url>    Scan a page of a running Chromium-based desktop app
+                      (Electron, NW.js, CEF, WebView2) through its local
+                      DevTools port instead of loading a URL. The page is
+                      scanned as shown and left as found: never navigated,
+                      resized or closed. Takes no file or URL targets
+  --target <text>     With --cdp: pick the page whose URL or title contains
+                      this text when the app has more than one
   --help              Show this help message
 
 Advisory findings:
@@ -166,11 +175,14 @@ Detection modes:
   Non-HTML files Regex pattern matching (CSS, JSX, TSX, etc.)
   URLs           Puppeteer full browser rendering (auto-detected;
                  http(s):// and file:// URLs; accessible linked CSS included)
+  Running apps   --cdp: a page of a Chromium-based app, attached through its
+                 DevTools port and scanned like a URL
 
 Examples:
   impeccable detect src/
   impeccable detect index.html
   impeccable detect https://example.com
+  impeccable detect --cdp 9222 --target "My App" --json
   impeccable detect --json .
   impeccable detect --no-config src/
 ```
@@ -377,6 +389,26 @@ Optional keys added later by engines (appended after the above): `ignoreValue` (
   - **The page's own built-ins** (Rust engine). Before any page script runs, every document the URL engine loads gets the built-ins the engine's page scripts use (`Map`, `Set`, `Array.from`, `JSON.stringify`, ...) captured from its untouched globals, so a page that declares its own global `Map` or reassigns `Array.from` still scans. The stash is a page-visible, non-enumerable `window.__impeccableNatives`, so a page can detect the scan, and a page script declaring `let __impeccableNatives` throws.
 - `createBrowserDetector(options)`: shared browser, defaults `waitUntil:'load'`, `settleMs:100`, `viewport 1280x800`; `close()` closes only an owned browser.
 - Tests: `tests/detect-url-launch.test.mjs`, `tests/detect-antipatterns-browser.test.mjs`.
+
+#### Attached pages: `impeccable detect --cdp` (Rust engine, `crates/browser/src/attach.rs`)
+
+Scans a page of an app that is already running (Electron, NW.js, CEF, WebView2, or a Chrome started with `--remote-debugging-port`) and prints exactly what a URL scan prints: the same findings array under `--json`, the same text format, notes and exit codes, with every finding's `file` the page's URL (`cdp-target:<id>` when it has none). One difference: under `--json` its capture notes (the hidden-window and stalled-screenshot lines below) go to stderr, one per line, since they say which contrast reads did not run; stdout is still only the JSON. Issue #951.
+
+- **Endpoint.** `GET http://<host>:<port>/json/version` (5 s timeouts) gives `webSocketDebuggerUrl`; its path is dialled at the host and port given, whatever host the endpoint writes into the URL. A `ws://.../devtools/browser/<id>` value skips that request. Before connecting, a host that resolves to any address that is not loopback is refused. Failures, each `stderr> Error: <message>\n` and `exit 1` (no findings; `[]` on stdout under `--json`):
+  - unreachable: `could not reach a DevTools endpoint at <host:port> (<os error>). Start the app with --remote-debugging-port=<port> (Electron, NW.js, CEF; for WebView2 set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>), then run this again.`
+  - not DevTools: `<host:port> answered, but not as a DevTools endpoint (GET /json/version: HTTP <status>|no webSocketDebuggerUrl). <the same hint>`
+- **Picking the page.** Candidates are `Target.getTargets` entries of type `page` whose URL does not start with `devtools://`, in the browser's order. A `ws://.../devtools/page/<id>` value picks that id (`no page with id <id> is open on <host:port>. Open pages:<list>` otherwise). Else `--target` keeps the pages whose URL or title contains it, case-insensitively, or whose id it is; without `--target` every candidate is kept. Exactly one left is scanned. Otherwise:
+  - none open: `no pages are open on <host:port> to scan.`
+  - `--target` matched none: `no page on <host:port> has a URL or title containing "<t>". Open pages:<list>`
+  - `--target` matched several: `<n> pages on <host:port> match "<t>". Rerun with a --target that names one of them (a longer part of its URL or title, or its id):<list>`
+  - several and no `--target`: `<n> pages are open on <host:port>. Rerun with --target and part of the URL or title of the one to scan (or its id):<list>`
+  - `<list>` is one line per page, `\n  <url>  "<title>"  (id <targetId>)`, the title part left out when empty, `(no URL)` for an empty URL.
+- **A session that owns nothing.** The engine never launches or closes the browser, never navigates or reloads, never calls `Emulation.*` (no viewport, device scale or media override), and detaches (`Target.detachFromTarget`) instead of closing the page. It enables `Page` and `Runtime` on its own session only (no `Network`, no auto-attach, no new-document scripts). No evaluation is a user gesture (`userGesture: false`), so the page's user activation is unchanged.
+- **An isolated world.** Every evaluation runs in an isolated world created on the page's current document (`Page.createIsolatedWorld`): the page's scripts never see the scan's globals, and the capture reads untouched built-ins whatever the page did to `Map` or `Array.from` (the new-document natives stash URL scans rely on cannot apply to a document that is already loaded). A navigation during the scan destroys the world and the scan fails (`Error: isolated capture context was destroyed or document changed`) instead of reading another document. `Runtime.evaluate` is not subject to the page's CSP, so a strict CSP does not stop the capture; a `style-src` without `'unsafe-inline'` does block the pixel pass's hide style there as on a URL scan, and that pass then gives no pixel verdicts.
+- **Hidden windows.** In that world `requestAnimationFrame` fires on the next frame or after 100 ms, whichever comes first, and while `document.visibilityState` is `hidden` (a window behind others, minimized, or a background tab) `setTimeout` waits by posting messages until its time is up, since a hidden page's timers fire a second or more late. The page's own timers and frames are not touched. A hidden page paints no frames, and a screenshot of it can wait for one indefinitely (it does on Linux), so when the page is hidden at the visual pass the pixel reads are skipped: the analyses that read no screenshot still run, the element pass's verdicts on text it handed to the pixels stand as advisory (as for any unread pixel verdict), and the text output adds `Capture note: <url> was hidden (minimized, or a background tab or window), so the pixel pass read nothing there. Bring it on screen, focused or not, and scan again for those contrast verdicts.` A screenshot of an attached page that takes over 15 s ends the pixel reads instead of the scan (any other error during them, a navigation included, still fails the scan), with `Capture note: the pixel pass on <url> stopped when a screenshot stalled (<error>). Bring the window on screen and scan again for the contrast verdicts it did not read.`
+- **The same passes, with three differences.** The page is scanned as it stands: no `goto`, no settle, and the viewport is the page's own (`Page.getLayoutMetrics` layout viewport). Consent and overlay hiding are off (as with `--no-consent-hiding --no-overlay-hiding`): the person seeded the state under review. The pixel pass reads what is on screen (`captureBeyondViewport: false`, which never lays the window out at another size), so a candidate whose clip is outside the visual viewport is scrolled into view first, as one past the content box is in a URL scan, and scrolled back; that also reaches text inside an inner scroller, which a URL scan's beyond-viewport capture leaves unread. Design systems: like an `http(s)` URL scan, none is loaded.
+- **Left as found.** Before the passes the engine records the window's scroll position and every element (open shadow roots included) scrolled off 0, and the pixel pass records each `video` it pauses. After them, on success and on error, it first cancels the scan's waits in the isolated world (so an evaluation that outlived its protocol timeout cannot scroll the page again), then scrolls each recorded element back, any other element the scan moved off 0 back to 0, the window last, plays again each video the pixel pass paused that has not ended, removes the pixel pass's `#impeccable-visual-contrast-hide-style` (unless the page already had one) and its marker attributes, and deletes the scan's globals from the isolated world. If that step fails the scan fails, findings and all: `stderr> Error: scanned <url> but could not put it back as it was (<why>); check its scroll position and any video it was playing.\n`, `exit 1`. The reveal sweep and the scroll probe still scroll the window through the document during the scan, so the page's scroll handlers run.
+- Tests: `crates/browser/tests/cdp_attach.rs` (a headless Chrome the test launches, attached to as an outside client).
 
 #### Static and regex engines (only what affects the contract)
 
