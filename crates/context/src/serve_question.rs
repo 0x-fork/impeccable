@@ -76,6 +76,20 @@ fn read_state(qdir: &str, key: &str) -> Option<Map<String, Value>> {
     serde_json::from_str::<Value>(&text).ok()?.as_object().cloned()
 }
 
+/// The URL a detached daemon recorded in its state file, polled until
+/// `deadline_ms`. A state file without a url is not ready yet: the daemon
+/// replaces it atomically, but one built before that could still be caught
+/// between creating the file and writing it.
+fn wait_for_daemon_url(qdir: &str, key: &str, deadline_ms: f64) -> Option<String> {
+    loop {
+        let url = read_state(qdir, key).and_then(|s| s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string));
+        if url.is_some() || now_ms() >= deadline_ms {
+            return url;
+        }
+        sleep_ms(100);
+    }
+}
+
 fn num_field(m: &Map<String, Value>, key: &str) -> Option<f64> {
     m.get(key).and_then(|v| v.as_f64())
 }
@@ -1475,11 +1489,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             cmd.spawn()
         };
         let _ = spawned; // detached: never waited on
-        let deadline = now_ms() + 8000.0;
-        while now_ms() < deadline && !exists(&state_file(&qdir, &key)) {
-            sleep_ms(100);
-        }
-        if !exists(&state_file(&qdir, &key)) {
+        let Some(daemon_url) = wait_for_daemon_url(&qdir, &key, now_ms() + 8000.0) else {
             let tail = safe_read(&log_file)
                 .map(|t| {
                     let lines: Vec<&str> = crate::util::js_trim(&t).split('\n').collect();
@@ -1491,12 +1501,11 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             let rel = jsp::relative(&cwd, &cwd, &log_file);
             io.err(&format!("serve-question: log at {}. A sandboxed exec that cannot listen on localhost causes exactly this; rerun this command once through the harness's network-enabled or unsandboxed command tool before falling back.\n", if rel.is_empty() { log_file.clone() } else { rel }));
             return 1;
-        }
-        let state = read_state(&qdir, &key).unwrap_or_default();
+        };
         if let Some(notice) = tracked_runtime_notice(&cwd) {
             io.out(&notice);
         }
-        io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
+        io.out(&format!("QUESTION URL: {}\n", daemon_url));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
         if comps_expected(&start_payload, &cwd, Some(&hand)) {
@@ -1535,6 +1544,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
     };
     let actual_port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
+    let _pool_nudge = crate::http_pool::keep_pool_moving(&server);
     let url = format!("http://127.0.0.1:{}/", actual_port);
     if a.has("detached-serve") {
         let _ = std::fs::create_dir_all(&qdir);
@@ -1545,7 +1555,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         if !comps.is_empty() {
             st["comps"] = json!(comps);
         }
-        let _ = std::fs::write(state_file(&qdir, &key), json_compact(&st));
+        let _ = impeccable_common::fsx::write_atomic(state_file(&qdir, &key), json_compact(&st).as_bytes());
     } else {
         io.out(&format!("QUESTION URL: {}\n", url));
         io.out("Waiting for the user to choose in the browser (Ctrl-C aborts)...\n");
@@ -1622,7 +1632,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                             } else {
                                 s.insert("comps".into(), json!(comps));
                             }
-                            let _ = std::fs::write(state_file(&st.qdir, &k), json_compact(&Value::Object(s)));
+                            let _ = impeccable_common::fsx::write_atomic(state_file(&st.qdir, &k), json_compact(&Value::Object(s)).as_bytes());
                         }
                     }
                 }
@@ -1646,7 +1656,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     st.last_beat_write = Some(now);
                     if let Some(mut s) = read_state(&st.qdir, &k) {
                         s.insert("lastBeat".into(), Value::from(now as i64));
-                        let _ = std::fs::write(state_file(&st.qdir, &k), json_compact(&Value::Object(s)));
+                        let _ = impeccable_common::fsx::write_atomic(state_file(&st.qdir, &k), json_compact(&Value::Object(s)).as_bytes());
                     }
                 }
             }
@@ -2575,6 +2585,30 @@ mod tests {
         std::fs::create_dir_all(dir.join(".impeccable/questions")).unwrap();
         std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
         dir
+    }
+
+    // --start reads the daemon's URL from its state file. A file that exists
+    // but has no url yet (empty, as a non-atomic write leaves it, or url-less)
+    // keeps --start polling; only a recorded url ends the wait.
+    #[test]
+    fn start_waits_for_a_state_file_that_records_the_url() {
+        let dir = temp_project("state-not-ready");
+        let qdir = dir.join(".impeccable/questions").to_string_lossy().into_owned();
+        let state = state_file(&qdir, "k1");
+        std::fs::write(&state, "").unwrap();
+        assert_eq!(wait_for_daemon_url(&qdir, "k1", now_ms() + 250.0), None);
+        std::fs::write(&state, json_compact(&json!({ "pid": 1, "port": 0 }))).unwrap();
+        assert_eq!(wait_for_daemon_url(&qdir, "k1", now_ms() + 250.0), None);
+        let writer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                impeccable_common::fsx::write_atomic(&state, json_compact(&json!({ "pid": 1, "url": "http://127.0.0.1:9/" })).as_bytes()).unwrap();
+            })
+        };
+        assert_eq!(wait_for_daemon_url(&qdir, "k1", now_ms() + 5000.0).as_deref(), Some("http://127.0.0.1:9/"));
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn run_captured(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
