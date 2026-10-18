@@ -8,7 +8,12 @@ use crate::question_page::PAGE;
 use crate::util::{exists, is_dir, iso_now, json_compact, json_pretty, mtime_ms, now_ms, safe_read, utf16_len, Env};
 use impeccable_common::Io;
 use serde_json::{json, Map, Value};
+use impeccable_common::http::{Response, SerialServer};
 use std::sync::{Arc, Mutex};
+
+/// Ceiling on a POST body (`/answer`, `/build-path`, `/heartbeat`). The page
+/// sends a few hundred bytes; the cap only bounds a hostile local client.
+const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 
 const NEXT_CLAIM_GRACE_MS: f64 = 10000.0;
 
@@ -1536,15 +1541,14 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
     }
     let port = if port_arg.is_finite() && port_arg >= 0.0 { port_arg as u16 } else { 0 };
-    let server = match tiny_http::Server::http(("127.0.0.1", port)) {
+    let server = match SerialServer::bind(("127.0.0.1", port), MAX_REQUEST_BODY) {
         Ok(s) => s,
         Err(e) => {
             io.err(&format!("Error: listen EADDRINUSE: {}\n", e));
             return 1;
         }
     };
-    let actual_port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
-    let _pool_nudge = crate::http_pool::keep_pool_moving(&server);
+    let actual_port = server.port();
     let url = format!("http://127.0.0.1:{}/", actual_port);
     if a.has("detached-serve") {
         let _ = std::fs::create_dir_all(&qdir);
@@ -1565,7 +1569,6 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
     }
     let _ = io.stdout.flush();
     let started_at = now_ms();
-    let server = Arc::new(server);
     // Lifetime watchdog thread; exits the process like the JS setInterval.
     {
         let state = state.clone();
@@ -1589,31 +1592,23 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             }
         });
     }
-    for mut request in server.incoming_requests() {
-        let method = request.method().as_str().to_string();
-        let raw_url = request.url().to_string();
+    while let Some(mut request) = server.recv() {
+        let method = request.request.method.clone();
+        let raw_url = request.request.target.clone();
         // JS: every request passes the Host allowlist first; a foreign or
         // missing Host header is a 403.
-        let host = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Host"))
-            .map(|h| h.value.as_str().to_string());
+        let host = request.request.header("Host").map(str::to_string);
         if !allowed_host(host.as_deref(), actual_port) {
-            let _ = request.respond(tiny_http::Response::empty(403));
+            request.respond(&Response::new(403));
             continue;
         }
         // JS: new URL(req.url, 'http://127.0.0.1'); a target the URL parser
         // rejects is a 400.
         let Some((path, query)) = parse_request_url(&raw_url) else {
-            let _ = request.respond(tiny_http::Response::empty(400));
+            request.respond(&Response::new(400));
             continue;
         };
-        let origin = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Origin"))
-            .map(|h| h.value.as_str().to_string());
+        let origin = request.request.header("Origin").map(str::to_string);
         let mut st = state.lock().unwrap();
         if method == "GET" && path == "/" {
             if let Some(pending) = st.next_file() {
@@ -1638,17 +1633,15 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 }
             }
             let html = st.page(st.awaiting_next);
-            let resp = tiny_http::Response::from_string(html)
-                .with_header(tiny_http::Header::from_bytes("content-type", "text/html; charset=utf-8").unwrap());
-            let _ = request.respond(resp);
+            request.respond(&Response::new(200).header("content-type", "text/html; charset=utf-8").text(&html));
             continue;
         }
         if method == "POST" && path == "/heartbeat" {
             if let Some(code) = reject_detached_post(st.detached_key.as_deref(), origin.as_deref(), &query, actual_port) {
-                let _ = request.respond(tiny_http::Response::empty(code));
+                request.respond(&Response::new(code));
                 continue;
             }
-            let _ = request.respond(tiny_http::Response::empty(204));
+            request.respond(&Response::new(204));
             st.last_beat_seen = Some(now_ms());
             if let Some(k) = st.detached_key.clone() {
                 let now = now_ms();
@@ -1664,9 +1657,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
         if method == "GET" && path == "/next-status" {
             let ready = st.next_file().map(|p| exists(&p)).unwrap_or(false);
-            let resp = tiny_http::Response::from_string(format!("{{\"ready\":{}}}", ready))
-                .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap());
-            let _ = request.respond(resp);
+            request.respond(&Response::new(200).header("content-type", "application/json").text(&format!("{{\"ready\":{}}}", ready)));
             continue;
         }
         if method == "GET" && path.starts_with("/img/") {
@@ -1689,11 +1680,10 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                             "image/jpeg"
                         };
                         let bytes = std::fs::read(&abs).unwrap_or_default();
-                        let resp = tiny_http::Response::from_data(bytes).with_header(tiny_http::Header::from_bytes("content-type", ty).unwrap());
-                        let _ = request.respond(resp);
+                        request.respond(&Response::new(200).header("content-type", ty).bytes(bytes));
                     }
                     _ => {
-                        let _ = request.respond(tiny_http::Response::empty(404));
+                        request.respond(&Response::new(404));
                     }
                 }
                 continue;
@@ -1716,14 +1706,14 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                         if raw { "'none'" } else { "'unsafe-inline'" },
                         if raw { "sandbox" } else { "sandbox allow-scripts" }
                     );
-                    let mut resp = tiny_http::Response::from_string(body);
+                    let mut resp = Response::new(200).text(&body);
                     for (k, v) in [("content-type", "text/html; charset=utf-8"), ("cache-control", "no-store"), ("x-content-type-options", "nosniff"), ("referrer-policy", "no-referrer"), ("content-security-policy", csp.as_str())] {
-                        resp = resp.with_header(tiny_http::Header::from_bytes(k, v).unwrap());
+                        resp = resp.header(k, v);
                     }
-                    let _ = request.respond(resp);
+                    request.respond(&resp);
                 }
                 None => {
-                    let _ = request.respond(tiny_http::Response::empty(404));
+                    request.respond(&Response::new(404));
                 }
             }
             continue;
@@ -1732,13 +1722,16 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             // JS: both handlers start with rejectDetachedPost (the /answer gate
             // from #555, the /build-path gate from the follow-up commit).
             if let Some(code) = reject_detached_post(st.detached_key.as_deref(), origin.as_deref(), &query, actual_port) {
-                let _ = request.respond(tiny_http::Response::empty(code));
+                request.respond(&Response::new(code));
                 continue;
             }
-            let mut body = String::new();
-            let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
-            let ok_resp = || tiny_http::Response::from_string("{\"ok\":true}")
-                .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap());
+            if request.request.body_truncated {
+                request.respond(&Response::new(413));
+                continue;
+            }
+            // Read as UTF-8 or not at all, as `read_to_string` did.
+            let body = String::from_utf8(std::mem::take(&mut request.request.body)).unwrap_or_default();
+            let ok_resp = || Response::new(200).header("content-type", "application/json").text("{\"ok\":true}");
             if path == "/build-path" {
                 let value = serde_json::from_str::<Value>(&body).ok().and_then(|v| v.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()));
                 if let Some(value) = value.filter(|v| v == "comp" || v == "code") {
@@ -1758,10 +1751,10 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 // caller: the 200 reached the client (a separate process) while this
                 // one could still be preempted before the write landed, so a poller
                 // that trusted the 200 could look for the flip file and miss it.
-                let _ = request.respond(ok_resp());
+                request.respond(&ok_resp());
                 continue;
             }
-            let _ = request.respond(ok_resp());
+            request.respond(&ok_resp());
             // /answer
             let parsed = serde_json::from_str::<Value>(&body).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default();
             let option_id = parsed.get("optionId").cloned().unwrap_or(Value::Null);
@@ -1869,7 +1862,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             }
             continue;
         }
-        let _ = request.respond(tiny_http::Response::empty(404));
+        request.respond(&Response::new(404));
     }
     0
 }
@@ -3970,6 +3963,38 @@ mod tests {
             return 0;
         }
         server.join().unwrap()
+    }
+
+    /// A decision page opens a socket per card image and keeps some idle.
+    /// Under tiny_http 0.12 part of such a burst was never answered (#1071);
+    /// every request must be.
+    #[test]
+    fn a_burst_of_connections_is_fully_served() {
+        let dir = temp_project("burst");
+        let qdir = dir.join(".impeccable/questions");
+        let payload = json!({ "options": [{ "id": "a", "label": "A" }, { "id": "b", "label": "B" }] });
+        std::fs::write(dir.join("payload.json"), payload.to_string()).unwrap();
+        let cwd = dir.clone();
+        let server = std::thread::spawn(move || {
+            let (mut io, _cap) = Io::captured("", cwd, Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string()), ("IMPECCABLE_NO_TELEMETRY".to_string(), "1".to_string())]));
+            let argv: Vec<String> = ["--payload", "payload.json", "--detached-serve", "--key", "pk", "--timeout", "0", "--no-open"].iter().map(|s| s.to_string()).collect();
+            run(&argv, &mut io)
+        });
+        let deadline = now_ms() + 5000.0;
+        let port = loop {
+            if let Some(p) = read_state(&qdir.to_string_lossy(), "pk").and_then(|s| s.get("port").and_then(Value::as_u64)) {
+                break p as u16;
+            }
+            assert!(now_ms() < deadline, "server never wrote its state");
+            sleep_ms(20);
+        };
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let request = format!("GET /img/0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        for _ in 0..3 {
+            assert_eq!(impeccable_common::http::burst_answered(addr, request.as_bytes(), 4, 8), 8, "connections stranded");
+        }
+        ureq::post(&format!("http://127.0.0.1:{}/answer?key=pk", port)).send_string(&json!({ "optionId": "a" }).to_string()).unwrap();
+        assert_eq!(server.join().unwrap(), 0);
     }
 
     #[test]

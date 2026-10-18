@@ -223,6 +223,9 @@ export const SUITES = {
       ...COMMON_INFRA_PATTERNS,
       /^skill\/scripts\/live-browser/,
       /^ENGINE_VERSION$/,
+      // The HTTP core the live server runs on (in common since the decision
+      // page and component review share it) and live's re-export of it.
+      /^crates\/(common\/src\/http|live\/src\/live_http)\.rs$/,
       /^tests\/framework-fixtures/,
       /^tests\/live-e2e(\.test\.mjs|\/)/,
       /^browser-bundle\/40-overlay\.js$/,
