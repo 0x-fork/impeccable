@@ -2549,6 +2549,26 @@ mod tests {
         assert!(PAGE.contains("--review-media-paper"));
     }
 
+    // Issue #1054: WKWebView in-app browsers can flatten the card's 3D context
+    // and ignore backface-visibility, painting the back face mirrored over the
+    // front. The visible face is chosen by an opacity swap instead, driven by
+    // the turn's computed angle rather than a timer, so a flip reversed
+    // mid-turn still swaps at edge-on.
+    #[test]
+    fn card_flip_does_not_depend_on_backface_visibility() {
+        assert!(!PAGE.contains("backface-visibility: hidden"));
+        assert!(PAGE.contains(".face.back { opacity: 0; }"));
+        assert!(PAGE.contains(".card[data-face=\"back\"] .face.back { opacity: 1; }"));
+        assert!(PAGE.contains(".card[data-face=\"back\"] .face.front { opacity: 0; }"));
+        assert!(!PAGE.contains(".face.front, .face.back { transition"), "no timed swap: a reversed flip shortens the turn");
+        assert!(!PAGE.contains(".card.flipped .face.back { opacity"), "the flipped class is the target, not the shown face");
+        // The swap reads the real rotation each frame of the turn.
+        assert!(PAGE.contains("new DOMMatrixReadOnly(t).m11 < 0 ? 'back' : 'front'"));
+        assert!(PAGE.contains("card.classList.toggle('flipped');\n    syncFace(card);"));
+        assert!(PAGE.contains("card.classList.remove('flipped'); syncFace(card);"));
+        assert!(PAGE.contains("@media (prefers-reduced-motion: reduce) { .card-inner { transition: none; } }"));
+    }
+
     fn temp_project(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("impeccable-sq-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
