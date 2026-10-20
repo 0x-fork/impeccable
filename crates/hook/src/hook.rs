@@ -216,10 +216,7 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
             last_skip = "extension";
             continue;
         }
-        let rel_for_match = relativize(rt, file_path, &project_cwd);
-        if matches_any_glob_list(&rel_for_match, &config.ignore_files)
-            || matches_any_glob_list(file_path, &config.ignore_files)
-        {
+        if is_ignored_file(&rt.proc_cwd, file_path, &project_cwd, &config.ignore_files) {
             last_skip = "config-ignore-file";
             continue;
         }
@@ -768,10 +765,7 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
         if !ALLOWED_EXTS.contains(&ext.as_str()) && configured.is_none() {
             continue;
         }
-        let rel = relativize(rt, file_path, &project_cwd);
-        if matches_any_glob_list(&rel, &config.ignore_files)
-            || matches_any_glob_list(file_path, &config.ignore_files)
-        {
+        if is_ignored_file(&rt.proc_cwd, file_path, &project_cwd, &config.ignore_files) {
             continue;
         }
         if !exists(file_path) || !is_scan_target_inside_project(rt, file_path, &project_cwd) {
