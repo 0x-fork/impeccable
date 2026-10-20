@@ -338,6 +338,26 @@ pub fn resolve_cache_cwd(rt: &Runtime, primary_file: Option<&str>, session_cwd: 
     }
 }
 
+/// The Stop event names no file, so the per-edit pass may have keyed this
+/// session's cache to a project root above the session cwd (#1088). Use the
+/// nearest directory, from the session cwd up to (not including) the home
+/// dir, whose cache lists files this session touched; else the session cwd.
+pub fn resolve_stop_cwd(rt: &Runtime, session_cwd: &str, session_id: &str) -> String {
+    let mut dir = session_cwd.to_string();
+    let home = rt.resolve(&[&rt.homedir()]);
+    while dir != home {
+        if !touched_files(&read_cache(&dir), session_id).is_empty() {
+            return dir;
+        }
+        let parent = jsp::dirname(&dir);
+        if parent == dir {
+            break;
+        }
+        dir = parent;
+    }
+    session_cwd.to_string()
+}
+
 /// JS: resolveProjectPlatform(cwd) — `extractPlatform(loadContext(cwd).product)`.
 /// Only the platform is observable, so this reads PRODUCT.md through the same
 /// resolution and skips loadContext's surface-brief and visual-implementation
