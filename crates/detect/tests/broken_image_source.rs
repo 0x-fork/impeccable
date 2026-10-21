@@ -11,6 +11,8 @@ fn source_images_distinguish_markup_from_bindings_and_code_literals() {
         ("TooltipSameLine.svelte", include_str!("fixtures/broken-image/tooltip-same-line.svelte"), &[]),
         // A block closer (`{/if}`) is not the start of a regex.
         ("Block.svelte", include_str!("fixtures/broken-image/block-close.svelte"), &[2]),
+        // An attribute expression has no block closers: `{/` there is a regex.
+        ("Title.svelte", include_str!("fixtures/broken-image/attribute-regex.svelte"), &[]),
         ("View.astro", include_str!("fixtures/broken-image/shorthand.astro"), &[4]),
         // Elements nested in an expression, with apostrophes in their text.
         ("List.astro", include_str!("fixtures/broken-image/expressions.astro"), &[4, 5]),

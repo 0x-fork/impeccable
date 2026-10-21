@@ -1918,9 +1918,7 @@ fn void_element(name: &[u8]) -> bool {
     .any(|v| name.eq_ignore_ascii_case(v))
 }
 
-/// In Svelte and Vue (no nested tags), `{/` closes a block (`{/if}`); it
-/// never opens a regex.
-fn expression_frame(b: &[u8], start: usize, options: MarkupScanOptions) -> MarkupFrame {
+fn expression_frame(start: usize, regex_can_start: bool) -> MarkupFrame {
     MarkupFrame::Expression {
         start,
         depth: 1,
@@ -1928,7 +1926,7 @@ fn expression_frame(b: &[u8], start: usize, options: MarkupScanOptions) -> Marku
         escaped: false,
         line_comment: false,
         block_comment: false,
-        regex_can_start: options.nested_tags || b.get(start + 1) != Some(&b'/'),
+        regex_can_start,
         word: Vec::new(),
     }
 }
@@ -2140,7 +2138,10 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                 }
                 if options.expressions && b[p] == b'{' {
                     context[p] = MarkupContext::Expression;
-                    stack.push(expression_frame(b, p, options));
+                    // In Svelte and Vue text, `{/` closes a block (`{/if}`);
+                    // it never opens a regex.
+                    let block_close = !options.nested_tags && b.get(p + 1) == Some(&b'/');
+                    stack.push(expression_frame(p, !block_close));
                 }
                 p += 1;
             }
@@ -2178,7 +2179,7 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     }
                     b'{' if options.expressions => {
                         context[p] = MarkupContext::Expression;
-                        stack.push(expression_frame(b, p, options));
+                        stack.push(expression_frame(p, true));
                         p += 1;
                     }
                     b'>' => {
