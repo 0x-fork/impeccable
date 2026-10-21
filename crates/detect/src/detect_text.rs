@@ -1892,8 +1892,10 @@ pub fn run_regex_matchers(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let ext = ext_from_file_path(file_path);
-    // Only the image rule consumes this view: other rules intentionally
-    // inspect strings (copy, CSS-in-JS, design tokens).
+    // The image rule reads tags that may span lines, so it walks one joined
+    // text from each line's start, with JS/TS literals masked. Only it uses
+    // this view: other rules intentionally inspect strings (copy, CSS-in-JS,
+    // design tokens).
     let image_source = once_cell::unsync::OnceCell::new();
     // The joined text the side-tab scope reader walks, built once per file,
     // and the stylesheet index over it, built on the first accent it gates.
@@ -1903,18 +1905,33 @@ pub fn run_regex_matchers(
     for matcher in REGEX_MATCHERS.iter() {
         let run = || {
             let mut matches = Vec::new();
-            let image_lines;
-            let match_lines = if matcher.id == "broken-image" && JS_SOURCE_EXTS.contains(&ext.as_str()) {
-                let masked = image_source.get_or_init(|| mask_js_literals(
-                    &lines.join("\n"), matches!(ext.as_str(), ".js" | ".jsx" | ".tsx"),
-                ));
-                image_lines = masked.split('\n').collect::<Vec<_>>();
-                &image_lines
-            } else {
-                lines
-            };
-            for (i, line) in match_lines.iter().enumerate() {
-                let ctxs: Vec<MatchCtx> = (matcher.find_all)(line);
+            let image = matcher.id == "broken-image";
+            if image && !lines.iter().any(|l| l.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"<img"))) {
+                return matches;
+            }
+            for (i, line) in lines.iter().enumerate() {
+                let (line, ctxs): (&str, Vec<MatchCtx>) = if image {
+                    let (text, starts) = image_source.get_or_init(|| {
+                        let joined = lines.join("\n");
+                        let mut starts = Vec::with_capacity(lines.len());
+                        let mut at = 0;
+                        for l in lines {
+                            starts.push(at);
+                            at += l.len() + 1;
+                        }
+                        // Masking keeps every byte offset and newline.
+                        let text = if JS_SOURCE_EXTS.contains(&ext.as_str()) {
+                            mask_js_literals(&joined, matches!(ext.as_str(), ".js" | ".jsx" | ".tsx"))
+                        } else {
+                            joined
+                        };
+                        (text, starts)
+                    });
+                    let rest = &text[starts[i]..];
+                    (&rest[..line.len()], crate::regex_matchers::find_broken_images(rest))
+                } else {
+                    (line, (matcher.find_all)(line))
+                };
                 if ctxs.is_empty() {
                     continue;
                 }

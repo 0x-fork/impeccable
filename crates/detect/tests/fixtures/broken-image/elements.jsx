@@ -19,3 +19,14 @@ export const Nested = () => <div>Don't forget <img /></div>;
 export const Attribute = () => <Box icon={<img src="#" />} label="Portrait" />;
 if (ready) /<img [^>]*badges[^>]*>/.test(text);
 export const AfterCondition = () => <img />;
+export const Multi = () => (
+  <img
+    src={src}
+    alt=""
+  />
+);
+export const MultiMissing = () => (
+  <img
+    alt=""
+  />
+);

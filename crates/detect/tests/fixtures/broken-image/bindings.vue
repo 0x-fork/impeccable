@@ -6,4 +6,7 @@
   <img v-bind="props" alt="">
   <img alt=":src" data-note="v-bind:src">
   <img src="#" alt="">
+  <img
+    :src="src"
+    alt="">
 </template>

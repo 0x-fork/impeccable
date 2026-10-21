@@ -1760,7 +1760,6 @@ pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
     let vue = ext == ".vue";
     let b = tag.as_bytes();
     let mut p = 4; // <img
-    let mut missing = true;
     while p < b.len() {
         while p < b.len() && (b[p].is_ascii_whitespace() || b[p] == b'/') { p += 1; }
         if p >= b.len() || b[p] == b'>' { break; }
@@ -1781,11 +1780,17 @@ pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
         while p < b.len() && !b[p].is_ascii_whitespace() && !matches!(b[p], b'=' | b'>' | b'/') { p += 1; }
         let name = &tag[start..p];
         while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
-        if vue && (name == ":src" || name == "v-bind:src" || name == "v-bind"
-            || name.starts_with(":src.") || name.starts_with("v-bind:src.")) {
+        let source = names_image_source(name);
+        let directive = name.contains(':');
+        if vue && ((source && directive) || name == "v-bind") {
             return false;
         }
-        if p >= b.len() || b[p] != b'=' { continue; }
+        if p >= b.len() || b[p] != b'=' {
+            // Svelte `bind:src` alone is shorthand for `bind:src={src}`;
+            // a bare `src` is still empty.
+            if source && directive { return false; }
+            continue;
+        }
         p += 1;
         while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
         let value_start = p;
@@ -1804,40 +1809,131 @@ pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
             while p < b.len() && !b[p].is_ascii_whitespace() && b[p] != b'>' { p += 1; }
             Some(&tag[value_start..p])
         };
-        // Preserve existing support for bound sources even outside Vue.
-        if name.eq_ignore_ascii_case("src") || name == ":src" || name == "v-bind:src" {
-            missing = value.is_some_and(|v| v.trim().is_empty() || v.trim() == "#");
+        // Any source with a value, or bound to an expression, is present.
+        let empty = value.is_some_and(|v| v.trim().is_empty() || v.trim() == "#");
+        if source && !empty {
+            return false;
         }
     }
-    missing
+    true
 }
 
-fn find_broken_images(line: &str) -> Vec<MatchCtx> {
+/// `src`, a binding of it (`:src`, `v-bind:src`, Svelte `bind:src`, Vue
+/// modifiers), or an alias such as lazy loading's `data-src`, all of which
+/// the original `\bsrc\s*=` matcher accepted.
+fn names_image_source(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    base.eq_ignore_ascii_case("src")
+        || base
+            .rsplit_once(|c| c == ':' || c == '-')
+            .is_some_and(|(_, last)| last.eq_ignore_ascii_case("src"))
+}
+
+/// How far a tag may run past its `<img`, so an unclosed one costs little.
+const MAX_IMG_TAG_BYTES: usize = 8 * 1024;
+
+enum TagScan {
+    /// The tag's closing `>`.
+    End(usize),
+    /// The probe sits in a quoted attribute value or an expression's string.
+    Hidden,
+    /// The probe sits in an expression as code (nested JSX).
+    Visible,
+    NotATag,
+}
+
+/// Walk the markup tag opened at `start`. Attribute quotes close at the next
+/// matching quote with no escapes (HTML, Svelte, Vue and JSX strings alike),
+/// `{...}` expressions follow JS rules, and a top-level `<` means the text
+/// was never a tag.
+fn scan_markup_tag(b: &[u8], start: usize, probe: Option<usize>) -> TagScan {
+    let inside = |open: usize, close: usize| probe.filter(|x| *x > open && *x < close);
+    let mut p = start + 1;
+    while p < b.len() {
+        match b[p] {
+            b'>' => return TagScan::End(p),
+            b'<' => return TagScan::NotATag,
+            quote @ (b'"' | b'\'') => {
+                let Some(close) = b[p + 1..].iter().position(|c| *c == quote) else {
+                    return TagScan::NotATag;
+                };
+                let close = p + 1 + close;
+                if inside(p, close).is_some() {
+                    return TagScan::Hidden;
+                }
+                p = close + 1;
+            }
+            b'{' => {
+                let Some(close) = matching_close(b, p) else { return TagScan::NotATag; };
+                if let Some(x) = inside(p, close) {
+                    return if in_js_string(&b[p..x]) { TagScan::Hidden } else { TagScan::Visible };
+                }
+                p = close + 1;
+            }
+            _ => p += 1,
+        }
+    }
+    TagScan::NotATag
+}
+
+fn in_js_string(b: &[u8]) -> bool {
+    let mut quote = None;
+    let mut p = 0;
+    while p < b.len() {
+        match (quote, b[p]) {
+            (Some(_), b'\\') => p += 1,
+            (Some(q), c) if c == q => quote = None,
+            (None, c @ (b'"' | b'\'' | b'`')) => quote = Some(c),
+            _ => {}
+        }
+        p += 1;
+    }
+    quote.is_some()
+}
+
+/// A candidate inside an earlier tag's quoted attribute on its line is text;
+/// one in a JSX attribute expression is a real nested element.
+fn hidden_in_parent_tag(line: &[u8], at: usize) -> bool {
+    let mut i = 0;
+    while i < at {
+        if line[i] == b'<' && line.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            match scan_markup_tag(line, i, Some(at)) {
+                TagScan::Hidden => return true,
+                TagScan::Visible => return false,
+                TagScan::End(end) => {
+                    i = end + 1;
+                    continue;
+                }
+                TagScan::NotATag => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `text` runs from the start of a line to the end of the file: candidates
+/// start on that line, and a tag may continue on the lines after it.
+pub(crate) fn find_broken_images(text: &str) -> Vec<MatchCtx> {
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
+    let b = text.as_bytes();
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(m) = IMG_OPEN_RE.find_at(line, pos) {
         pos = m.end();
-        // A candidate inside a quoted attribute is text; a candidate in a
-        // JSX attribute expression is a real nested element.
-        if let Some((parent, _)) = markup_tag_span(line, m.start()) {
-            let mut visible = false;
-            scan_js(line, parent + 1, |ch, offset, _, _, _| {
-                if offset == m.start() { visible = ch == '<'; return true; }
-                offset > m.start()
-            });
-            if parent != m.start() && !visible { continue; }
-        }
-        let mut end = None;
-        scan_js(line, m.end(), |ch, offset, _, _, depth| {
-            if ch == '>' && depth.brace == 0 { end = Some(offset); return true; }
-            false
-        });
-        let Some(end) = end else { continue; };
-        let tag = &line[m.start()..end + 1];
-        pos = end + 1;
+        if hidden_in_parent_tag(line.as_bytes(), m.start()) { continue; }
+        let window = &b[..b.len().min(m.start() + MAX_IMG_TAG_BYTES)];
+        let TagScan::End(end) = scan_markup_tag(window, m.start(), None) else { continue; };
+        pos = (end + 1).min(line.len());
+        let tag = &text[m.start()..end + 1];
         if image_source_is_missing(tag, "") {
+            let tag = if tag.contains('\n') {
+                tag.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+            } else {
+                tag.to_string()
+            };
             out.push(MatchCtx {
-                groups: vec![Some(tag.to_string())],
+                groups: vec![Some(tag)],
                 index: m.start(),
             });
         }
