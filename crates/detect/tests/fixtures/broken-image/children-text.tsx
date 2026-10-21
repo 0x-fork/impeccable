@@ -11,3 +11,6 @@ export function A({ items }) {
     </>
   );
 }
+export function L({ items }) {
+  return items.map((i) => <li /* note */><img alt="c" /></li>);
+}

@@ -9,6 +9,8 @@ fn source_images_distinguish_markup_from_bindings_and_code_literals() {
         ("View.svelte", include_str!("fixtures/broken-image/shorthand.svelte"), &[5, 6, 7, 11, 12]),
         ("TooltipMultiline.svelte", include_str!("fixtures/broken-image/tooltip-multiline.svelte"), &[]),
         ("TooltipSameLine.svelte", include_str!("fixtures/broken-image/tooltip-same-line.svelte"), &[]),
+        // A block closer (`{/if}`) is not the start of a regex.
+        ("Block.svelte", include_str!("fixtures/broken-image/block-close.svelte"), &[2]),
         ("View.astro", include_str!("fixtures/broken-image/shorthand.astro"), &[4]),
         // Elements nested in an expression, with apostrophes in their text.
         ("List.astro", include_str!("fixtures/broken-image/expressions.astro"), &[4, 5]),
@@ -23,7 +25,7 @@ fn source_images_distinguish_markup_from_bindings_and_code_literals() {
         ("View.jsx", include_str!("fixtures/broken-image/elements.jsx"), &[5, 6, 11, 14, 18, 19, 21, 29]),
         ("View.tsx", include_str!("fixtures/broken-image/elements.jsx"), &[5, 6, 11, 14, 18, 19, 21, 29]),
         // JSX children text (`Don't`, a URL, `and/or`) is text, not code.
-        ("Body.tsx", include_str!("fixtures/broken-image/children-text.tsx"), &[7, 10]),
+        ("Body.tsx", include_str!("fixtures/broken-image/children-text.tsx"), &[7, 10, 15]),
     ];
     for &(path, source, expected) in cases {
         let findings = detect_text(source, path, &TextOptions::default());

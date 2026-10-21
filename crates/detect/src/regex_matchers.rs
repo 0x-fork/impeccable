@@ -1918,7 +1918,9 @@ fn void_element(name: &[u8]) -> bool {
     .any(|v| name.eq_ignore_ascii_case(v))
 }
 
-fn expression_frame(start: usize) -> MarkupFrame {
+/// In Svelte and Vue (no nested tags), `{/` closes a block (`{/if}`); it
+/// never opens a regex.
+fn expression_frame(b: &[u8], start: usize, options: MarkupScanOptions) -> MarkupFrame {
     MarkupFrame::Expression {
         start,
         depth: 1,
@@ -1926,7 +1928,7 @@ fn expression_frame(start: usize) -> MarkupFrame {
         escaped: false,
         line_comment: false,
         block_comment: false,
-        regex_can_start: true,
+        regex_can_start: options.nested_tags || b.get(start + 1) != Some(&b'/'),
         word: Vec::new(),
     }
 }
@@ -2138,7 +2140,7 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                 }
                 if options.expressions && b[p] == b'{' {
                     context[p] = MarkupContext::Expression;
-                    stack.push(expression_frame(p));
+                    stack.push(expression_frame(b, p, options));
                 }
                 p += 1;
             }
@@ -2176,7 +2178,7 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     }
                     b'{' if options.expressions => {
                         context[p] = MarkupContext::Expression;
-                        stack.push(expression_frame(p));
+                        stack.push(expression_frame(b, p, options));
                         p += 1;
                     }
                     b'>' => {
@@ -2232,7 +2234,10 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     c => {
                         context[p] = MarkupContext::Tag;
                         if !c.is_ascii_whitespace() {
-                            *last_non_space = Some(c);
+                            // The `/` closing a `/* comment */` is not a
+                            // self-closing slash.
+                            let ends_comment = c == b'/' && *last_non_space == Some(b'*');
+                            *last_non_space = Some(if ends_comment { 0 } else { c });
                         }
                         p += 1;
                     }
