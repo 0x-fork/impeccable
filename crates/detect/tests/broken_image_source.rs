@@ -7,6 +7,8 @@ use impeccable_detect::detect_text::{detect_text, TextOptions};
 fn source_images_distinguish_markup_from_bindings_and_code_literals() {
     let cases: &[(&str, &str, &[usize])] = &[
         ("View.svelte", include_str!("fixtures/broken-image/shorthand.svelte"), &[5, 6, 7, 11, 12]),
+        ("TooltipMultiline.svelte", include_str!("fixtures/broken-image/tooltip-multiline.svelte"), &[]),
+        ("TooltipSameLine.svelte", include_str!("fixtures/broken-image/tooltip-same-line.svelte"), &[]),
         ("View.astro", include_str!("fixtures/broken-image/shorthand.astro"), &[4]),
         ("View.vue", include_str!("fixtures/broken-image/bindings.vue"), &[7, 8]),
         ("index.html", include_str!("fixtures/broken-image/missing.html"), &[1, 2, 3, 4, 5, 7, 9, 11, 18]),
