@@ -214,18 +214,25 @@ pub fn line_pitch_px(dom: &dyn Dom, el: ElId, own: f64) -> f64 {
 pub fn scrolling_ancestor_cuts(dom: &dyn Dom, el: ElId, text: &Rect) -> bool {
     let root = dom.document_element();
     let body = dom.body();
-    let mut cur = dom.parent(el);
+    // The flat tree: a component that slots its items into a scroller of its
+    // own shadow tree (ibm.com's `c4d-cta-block-item-row`, whose
+    // `div.scroll-container` scrolls the third card into view) scrolls them
+    // as surely as a light-DOM parent would.
+    let mut cur = dom.flat_parent(el);
     while let Some(p) = cur {
         if Some(p) == root || Some(p) == body {
             break;
         }
-        if scrolls_x(dom, p) || moves_a_track(dom, el, p) {
+        // A moved track is looked for on the light tree between `el` and
+        // the clip, so only a clip on that tree is asked.
+        let light = || std::iter::successors(dom.parent(el), |a| dom.parent(*a)).any(|a| a == p);
+        if scrolls_x(dom, p) || (light() && moves_a_track(dom, el, p)) {
             let cr = dom.rect(p);
             if cr.all_finite() && (text.left < cr.left - 1.0 || text.right > cr.right + 1.0) {
                 return true;
             }
         }
-        cur = dom.parent(p);
+        cur = dom.flat_parent(p);
     }
     false
 }

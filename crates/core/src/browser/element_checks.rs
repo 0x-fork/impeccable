@@ -4366,6 +4366,33 @@ fn generated_content_unmeasured(dom: &dyn Dom, el: ElId) -> bool {
     PSEUDOS.iter().any(|which| pseudo_unmeasured(dom, el, which))
 }
 
+/// Whether an absolutely positioned `::before` / `::after` generates one
+/// character drawn as a mark inside `el`: its box, placed from its containing
+/// block and moved by its transform ([`super::visual::pseudo_box`]), lies
+/// within `el`'s border box. hardyn.com.br strikes an out-of-stock size
+/// swatch with a rotated `content: "/"` at 50px, whose glyph raises the
+/// swatch's `scrollWidth` to 55px in a 35px box; the slash is a mark over the
+/// swatch, not a label running out of it. More than one character, a counter
+/// or an attribute, or a box the capture cannot place, stays unmeasured.
+fn is_placed_mark_inside(dom: &dyn Dom, el: ElId, which: &str, content: &str) -> bool {
+    let c = js::trim(content);
+    let quoted = c.len() >= 2
+        && ((c.starts_with('"') && c.ends_with('"')) || (c.starts_with('\'') && c.ends_with('\'')));
+    if !quoted || c[1..c.len() - 1].chars().count() != 1 {
+        return false;
+    }
+    let Some((placed, _)) = super::visual::pseudo_box(dom, el, which) else {
+        return false;
+    };
+    let host = dom.rect(el);
+    placed.all_finite()
+        && host.all_finite()
+        && placed.left >= host.left - 0.5
+        && placed.right <= host.right + 0.5
+        && placed.top >= host.top - 0.5
+        && placed.bottom <= host.bottom + 0.5
+}
+
 /// [`generated_content_unmeasured`] for one pseudo-element.
 fn pseudo_unmeasured(dom: &dyn Dom, el: ElId, which: &str) -> bool {
     if !pseudo_present(dom, el, which) {
@@ -4376,7 +4403,7 @@ fn pseudo_unmeasured(dom: &dyn Dom, el: ElId, which: &str) -> bool {
         return false;
     }
     if generated_content_has_text(&content) {
-        return true;
+        return !is_placed_mark_inside(dom, el, which, &content);
     }
     let position = pseudo_str(dom, el, which, "position");
     if position == "absolute" || position == "fixed" {
@@ -8821,6 +8848,51 @@ mod tests {
         assert!(check_element_text_overflow_dom(&d, tag).is_empty(), "an empty icon box");
         d.set_pseudo_style(icon, "::before", "content", "\"Featured this week\"");
         assert_eq!(check_element_text_overflow_dom(&d, tag).len(), 1, "an icon glyph string");
+    }
+
+    /// observations-1006 row 15, hardyn.com.br: an out-of-stock size swatch
+    /// struck through by a rotated `content: "/"` at 50px. The mark is
+    /// placed inside the 35px swatch, so its glyph raising `scrollWidth` to
+    /// 55px is no label running out of the box.
+    #[test]
+    fn text_overflow_measures_a_one_character_mark_placed_inside() {
+        let (mut d, body) = page();
+        let chip = d.add(Some(body), "li");
+        visible(&mut d, chip);
+        d.set_attr(chip, "class", "tamanho_produto");
+        d.add_text(chip, "P");
+        d.set_rect(chip, 181.875, 400.0, 35.0, 35.0);
+        d.el_mut(chip).client_width = 35.0;
+        d.el_mut(chip).client_height = 35.0;
+        d.el_mut(chip).scroll_width = 55.0;
+        d.set_styles(chip, &[("display", "flex"), ("overflow", "visible"), ("overflowX", "visible"), ("position", "relative"), ("fontSize", "20px")]);
+        d.set_text_rect(chip, 193.0, 402.5, 12.7, 29.0);
+        neighbor(&mut d, body, 222.0, 400.0, 35.0, 35.0, "M");
+        for (k, v) in [
+            ("content", "\"/\""),
+            ("position", "absolute"),
+            ("display", "block"),
+            ("width", "19.0938px"),
+            ("height", "20px"),
+            ("top", "-7.6875px"),
+            ("left", "10.5px"),
+            ("transform", "matrix(0.258819, -0.965926, 0.965926, 0.258819, -2.47091, 9.22157)"),
+            ("fontSize", "50px"),
+        ] {
+            d.set_pseudo_style(chip, "::after", k, v);
+        }
+        assert!(check_element_text_overflow_dom(&d, chip).is_empty(), "a mark inside the swatch");
+        // Placed past the swatch's edge, it is not a mark over it.
+        d.set_pseudo_style(chip, "::after", "left", "30px");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "placed outside");
+        d.set_pseudo_style(chip, "::after", "left", "10.5px");
+        // Two characters are text, not a mark.
+        d.set_pseudo_style(chip, "::after", "content", "\"//\"");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "two characters");
+        // A size the capture did not resolve to pixels cannot be placed.
+        d.set_pseudo_style(chip, "::after", "content", "\"/\"");
+        d.set_pseudo_style(chip, "::after", "width", "auto");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "unplaced");
     }
 
     /// observations-25 issue 18 (P19): text that runs past its own box into
