@@ -1751,43 +1751,95 @@ re!(
     CUBIC_BEZIER_RE,
     format!("cubic-bezier\\({WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*\\)")
 );
-re!(
-    BROKEN_IMG_SRC_RE,
-    format!(
-        "<{img}{B}[^>]*?{B}{src}{WS}*={WS}*(?:\"\"|''|\"{WS}+\"|'{WS}+'|\"#\"|'#')",
-        img = ci("img"),
-        src = ci("src")
-    )
-);
 re!(IMG_OPEN_RE, format!("<{}{B}", ci("img")));
-re!(SRC_ATTR_RE, format!("{B}{}{WS}*=", ci("src")));
 
-/// Hand-written port of `/<img\b(?:(?!\bsrc\s*=)[^>])*>/gi`.
-fn find_img_without_src(line: &str) -> Vec<MatchCtx> {
+/// Read attributes, not substrings of an attribute value or expression.
+/// Dynamic bindings/spreads cannot establish a missing source statically.
+pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
+    let shorthand = matches!(ext, ".svelte" | ".astro");
+    let vue = ext == ".vue";
+    let b = tag.as_bytes();
+    let mut p = 4; // <img
+    let mut missing = true;
+    while p < b.len() {
+        while p < b.len() && (b[p].is_ascii_whitespace() || b[p] == b'/') { p += 1; }
+        if p >= b.len() || b[p] == b'>' { break; }
+        if b[p] == b'{' {
+            let Some(close) = matching_close(b, p) else { return false; };
+            let expression = tag[p + 1..close].trim();
+            if shorthand && (expression == "src" || expression.starts_with("...")) {
+                return false;
+            }
+            // JSX spreads also leave the source unknown.
+            if matches!(ext, ".jsx" | ".tsx" | ".js") && expression.starts_with("...") {
+                return false;
+            }
+            p = close + 1;
+            continue;
+        }
+        let start = p;
+        while p < b.len() && !b[p].is_ascii_whitespace() && !matches!(b[p], b'=' | b'>' | b'/') { p += 1; }
+        let name = &tag[start..p];
+        while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
+        if vue && (name == ":src" || name == "v-bind:src" || name == "v-bind"
+            || name.starts_with(":src.") || name.starts_with("v-bind:src.")) {
+            return false;
+        }
+        if p >= b.len() || b[p] != b'=' { continue; }
+        p += 1;
+        while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
+        let value_start = p;
+        let value = if p < b.len() && matches!(b[p], b'\'' | b'"') {
+            let quote = b[p];
+            p += 1;
+            let start = p;
+            while p < b.len() && b[p] != quote { p += 1; }
+            let value = &tag[start..p];
+            p = (p + 1).min(b.len());
+            Some(value)
+        } else if p < b.len() && b[p] == b'{' {
+            p = matching_close(b, p).map(|close| close + 1).unwrap_or(b.len());
+            None
+        } else {
+            while p < b.len() && !b[p].is_ascii_whitespace() && b[p] != b'>' { p += 1; }
+            Some(&tag[value_start..p])
+        };
+        // Preserve existing support for bound sources even outside Vue.
+        if name.eq_ignore_ascii_case("src") || name == ":src" || name == "v-bind:src" {
+            missing = value.is_some_and(|v| v.trim().is_empty() || v.trim() == "#");
+        }
+    }
+    missing
+}
+
+fn find_broken_images(line: &str) -> Vec<MatchCtx> {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(m) = IMG_OPEN_RE.find_at(line, pos) {
-        let run_start = m.end();
-        let gt = line[run_start..].find('>').map(|i| i + run_start);
-        match gt {
-            Some(gt) => {
-                let has_src = SRC_ATTR_RE
-                    .find_at(line, run_start)
-                    .map(|s| s.start() < gt)
-                    .unwrap_or(false);
-                if has_src {
-                    pos = m.end();
-                    continue;
-                }
-                out.push(MatchCtx {
-                    groups: vec![Some(line[m.start()..gt + 1].to_string())],
-                    index: m.start(),
-                });
-                pos = gt + 1;
-            }
-            None => {
-                pos = m.end();
-            }
+        pos = m.end();
+        // A candidate inside a quoted attribute is text; a candidate in a
+        // JSX attribute expression is a real nested element.
+        if let Some((parent, _)) = markup_tag_span(line, m.start()) {
+            let mut visible = false;
+            scan_js(line, parent + 1, |ch, offset, _, _, _| {
+                if offset == m.start() { visible = ch == '<'; return true; }
+                offset > m.start()
+            });
+            if parent != m.start() && !visible { continue; }
+        }
+        let mut end = None;
+        scan_js(line, m.end(), |ch, offset, _, _, depth| {
+            if ch == '>' && depth.brace == 0 { end = Some(offset); return true; }
+            false
+        });
+        let Some(end) = end else { continue; };
+        let tag = &line[m.start()..end + 1];
+        pos = end + 1;
+        if image_source_is_missing(tag, "") {
+            out.push(MatchCtx {
+                groups: vec![Some(tag.to_string())],
+                index: m.start(),
+            });
         }
     }
     out
@@ -1993,14 +2045,8 @@ pub static REGEX_MATCHERS: Lazy<Vec<Matcher>> = Lazy::new(|| {
         },
         Matcher {
             id: "broken-image",
-            find_all: |l| all(&BROKEN_IMG_SRC_RE, l),
+            find_all: find_broken_images,
             test: |_, _| true,
-            fmt: |m, _| slice_utf16_start(m.whole(), 100),
-        },
-        Matcher {
-            id: "broken-image",
-            find_all: find_img_without_src,
-            test: |m, _| !SRC_ATTR_RE.is_match(m.whole()),
             fmt: |m, _| slice_utf16_start(m.whole(), 100),
         },
     ]
