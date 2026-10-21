@@ -933,9 +933,54 @@ fn is_media_player(dom: &dyn Dom, el: ElId, rect: &Rect) -> bool {
         && text_outside_controls(dom, el, &controls) <= CAPTION_MAX_CHARS
 }
 
+/// Whether a would-be occlusion victim paints no glyphs of its own: its text
+/// is set at 1px or less, or its text fill (`-webkit-text-fill-color`, which
+/// `color` sets unless it is given) is fully transparent with no stroke and
+/// no shadow, and no box on its chain clips a background to the text.
+/// a0lang.vercel.app's `div.rain` (observations-1006 row 17) is an
+/// `aria-hidden` layer at `font-size: 0` and transparent ink that a canvas
+/// draws for it. Any of the ink properties unrecorded keeps the victim.
+fn occlusion_victim_without_ink(dom: &dyn Dom, el: ElId) -> bool {
+    // Set at 1px, but drawn larger by a transform: `scale(16)` paints
+    // readable letters.
+    if super::painted::at_most_1px(&dom.style(el, "fontSize")) {
+        let drawn = js::parse_float(&dom.style(el, "fontSize")) * super::painted::drawn_enlargement(dom, el);
+        if drawn <= 1.0 {
+            return true;
+        }
+    }
+    let fill = dom.style(el, "webkitTextFillColor");
+    let fill = if js::trim(&fill).is_empty() { dom.style(el, "color") } else { fill };
+    let clear = parse_any_color(Some(&fill)).is_some_and(|c| c.alpha_or_one() <= 0.0);
+    if !clear {
+        return false;
+    }
+    let stroke = js::parse_float(&dom.style(el, "webkitTextStrokeWidth"));
+    let shadow = js::to_lower_case(js::trim(&dom.style(el, "textShadow")));
+    if !(stroke.is_finite() && stroke <= 0.0) || shadow != "none" {
+        return false;
+    }
+    // A glitch or duplicate-text effect clears the element's own ink and
+    // draws the words with a generated box (`content: attr(data-text)`).
+    let draws_text = |which: &str| {
+        dom.pseudo_style(el, which, "content").is_some_and(|c| {
+            let c = js::trim(&c);
+            !c.is_empty() && c != "none" && c != "normal" && c != "\"\"" && c != "''"
+        })
+    };
+    if draws_text("::before") || draws_text("::after") {
+        return false;
+    }
+    !ancestors_inclusive(dom, el).into_iter().any(|a| {
+        ["webkitBackgroundClip", "backgroundClip"]
+            .iter()
+            .any(|prop| js::to_lower_case(&dom.style(a, prop)).contains("text"))
+    })
+}
+
 /// Whether `el` is a dialog: a `<dialog>`, `role="dialog"` or
 /// `role="alertdialog"`, or `aria-modal="true"`.
-fn is_dialog_el(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn is_dialog_el(dom: &dyn Dom, el: ElId) -> bool {
     tag_lower(dom, el) == "dialog"
         || dom.attr(el, "role").is_some_and(|role| {
             role.split_ascii_whitespace()
@@ -4139,7 +4184,7 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         if !is_painted_for_occlusion(dom, el) {
             continue;
         }
-        if effective_opacity_dom(dom, el) <= 0.02 {
+        if effective_opacity_dom(dom, el) <= 0.02 || occlusion_victim_without_ink(dom, el) {
             continue;
         }
         let full = dom.rect(el);
@@ -6345,6 +6390,82 @@ mod tests {
                 class_selector(&d, sib)
             )
         );
+    }
+
+    /// a0lang.vercel.app (observations-1006 row 17): an `aria-hidden` rain
+    /// layer at `font-size: 0` and transparent ink, which a canvas draws,
+    /// is not covered text. Its should-flag twins keep reporting: the same
+    /// layer at 16px with ink, transparent ink with a stroke, and transparent
+    /// ink a parent's `background-clip: text` paints.
+    #[test]
+    fn text_occlusion_skips_a_victim_that_paints_no_glyphs() {
+        let base = &[("display", "block"), ("visibility", "visible"), ("opacity", "1"), ("contentVisibility", "visible"), ("position", "static"), ("cssFloat", "none"), ("animationName", "none")][..];
+        let run = |victim_styles: &[(&str, &str)], parent_clip: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let wrap = d.add(Some(body), "div");
+            d.set_styles(wrap, base);
+            d.set_styles(wrap, &[("backgroundClip", parent_clip), ("webkitBackgroundClip", parent_clip)]);
+            d.set_rect(wrap, 0.0, 0.0, 600.0, 400.0);
+            let txt = d.add(Some(wrap), "div");
+            d.add_text(txt, "fn let match ret u32 end");
+            d.set_styles(txt, base);
+            d.set_styles(txt, &[("overflow", "visible"), ("overflowX", "visible"), ("overflowY", "visible"), ("clip", "auto"), ("clipPath", "none")]);
+            d.set_styles(txt, victim_styles);
+            d.set_rect(txt, 100.0, 100.0, 240.0, 28.0);
+            let boxel = d.add(Some(body), "div");
+            d.set_styles(boxel, base);
+            d.set_styles(boxel, &[("position", "absolute"), ("backgroundColor", "rgb(20, 20, 20)")]);
+            d.set_rect(boxel, 100.0, 100.0, 240.0, 28.0);
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d).len()
+        };
+        let ink = [("textShadow", "none"), ("webkitTextStrokeWidth", "0px")];
+        let clear = |size: &'static str| {
+            vec![("fontSize", size), ("color", "rgba(0, 0, 0, 0)"), ("webkitTextFillColor", "rgba(0, 0, 0, 0)"), ink[0], ink[1]]
+        };
+        assert_eq!(run(&clear("0px"), "border-box"), 0);
+        assert_eq!(run(&clear("16px"), "border-box"), 0);
+        assert_eq!(run(&[("fontSize", "0.5px"), ("color", "rgb(10, 10, 10)")], "border-box"), 0);
+        // Should-flag twins.
+        assert_eq!(run(&[("fontSize", "16px"), ("color", "rgb(10, 10, 10)"), ink[0], ink[1]], "border-box"), 1);
+        let mut stroked = clear("16px");
+        stroked.push(("webkitTextStrokeWidth", "1px"));
+        assert_eq!(run(&stroked, "border-box"), 1);
+        let mut shadowed = clear("16px");
+        shadowed.push(("textShadow", "rgb(0, 0, 0) 0px 0px 2px"));
+        assert_eq!(run(&shadowed, "border-box"), 1);
+        assert_eq!(run(&clear("16px"), "text"), 1);
+        // Set at 1px and drawn at 16px by a transform: readable letters.
+        assert_eq!(
+            run(&[("fontSize", "1px"), ("color", "rgb(10, 10, 10)"), ("transform", "matrix(16, 0, 0, 16, 0, 0)"), ink[0], ink[1]], "border-box"),
+            1
+        );
+        // A glitch heading that clears its ink and draws the words with
+        // `::before` keeps reporting (review issue 6).
+        let glitch = |content: &'static str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let txt = d.add(Some(body), "h2");
+            d.add_text(txt, "Glitch heading");
+            d.set_styles(txt, base);
+            d.set_styles(txt, &[("overflow", "visible"), ("overflowX", "visible"), ("overflowY", "visible"), ("clip", "auto"), ("clipPath", "none")]);
+            d.set_styles(txt, &clear("16px"));
+            d.set_pseudo_style(txt, "::before", "content", content);
+            d.set_rect(txt, 100.0, 100.0, 240.0, 28.0);
+            let boxel = d.add(Some(body), "div");
+            d.set_styles(boxel, base);
+            d.set_styles(boxel, &[("position", "absolute"), ("backgroundColor", "rgb(20, 20, 20)")]);
+            d.set_rect(boxel, 100.0, 100.0, 240.0, 28.0);
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d).len()
+        };
+        assert_eq!(glitch("attr(data-text)"), 1);
+        assert_eq!(glitch("\"Glitch heading\""), 1);
+        assert_eq!(glitch("none"), 0);
+        // A fill the capture did not record leaves `color` to decide; ink
+        // properties it did not record keep the victim.
+        assert_eq!(run(&[("fontSize", "16px"), ("color", "rgba(0, 0, 0, 0)")], "border-box"), 1);
     }
 
     /// Decision r8-t2-occlusion-stacked-mockup (advisory): covered text in a
