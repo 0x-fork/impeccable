@@ -1939,6 +1939,7 @@ pub fn run_regex_matchers(
                             crate::regex_matchers::MarkupScanOptions {
                                 jsx,
                                 expressions: jsx || template,
+                                nested_tags: jsx || ext == ".astro",
                                 raw_text: !JS_SOURCE_EXTS.contains(&ext.as_str()) && !css,
                                 markup: !css,
                             },

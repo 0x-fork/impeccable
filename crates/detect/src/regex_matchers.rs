@@ -1842,8 +1842,12 @@ enum MarkupContext {
 
 #[derive(Clone, Copy)]
 pub(crate) struct MarkupScanOptions {
+    /// Attribute strings take backslash escapes (JSX).
     pub jsx: bool,
+    /// `{...}` opens a template expression.
     pub expressions: bool,
+    /// Expressions may hold elements whose children are text (JSX, Astro).
+    pub nested_tags: bool,
     pub raw_text: bool,
     pub markup: bool,
 }
@@ -1857,11 +1861,18 @@ pub(crate) struct MarkupContextIndex {
 
 enum MarkupFrame {
     Text,
+    /// An element opened inside an expression: its children are text until
+    /// the matching closing tag (an empty name is a fragment).
+    Children {
+        name_start: usize,
+        name_end: usize,
+    },
     Tag {
         start: usize,
         name_start: usize,
         name_end: usize,
         closing: bool,
+        nested: bool,
         raw_eligible: bool,
         image_slot: Option<usize>,
         quote: Option<u8>,
@@ -1869,6 +1880,7 @@ enum MarkupFrame {
         last_non_space: Option<u8>,
     },
     Expression {
+        start: usize,
         depth: usize,
         quote: Option<u8>,
         escaped: bool,
@@ -1884,6 +1896,71 @@ enum MarkupFrame {
 enum RawTag {
     Script,
     Style,
+}
+
+fn void_element(name: &[u8]) -> bool {
+    [
+        b"area".as_slice(),
+        b"base",
+        b"br",
+        b"col",
+        b"embed",
+        b"hr",
+        b"img",
+        b"input",
+        b"link",
+        b"meta",
+        b"source",
+        b"track",
+        b"wbr",
+    ]
+    .iter()
+    .any(|v| name.eq_ignore_ascii_case(v))
+}
+
+fn expression_frame(start: usize) -> MarkupFrame {
+    MarkupFrame::Expression {
+        start,
+        depth: 1,
+        quote: None,
+        escaped: false,
+        line_comment: false,
+        block_comment: false,
+        regex_can_start: true,
+        word: Vec::new(),
+    }
+}
+
+/// Open the tag at `p` (already checked by `tag_open`), recording an image
+/// candidate, and return the offset just past its name.
+fn open_tag_frame(
+    b: &[u8],
+    p: usize,
+    (name_start, name_end, closing): (usize, usize, bool),
+    nested: bool,
+    raw_eligible: bool,
+    context: &mut [MarkupContext],
+    images: &mut Vec<(usize, usize)>,
+    stack: &mut Vec<MarkupFrame>,
+) -> usize {
+    mark_range(context, p, name_end, MarkupContext::Tag);
+    let image_slot = (!closing && image_tag_start(b, p)).then(|| {
+        images.push((p, 0));
+        images.len() - 1
+    });
+    stack.push(MarkupFrame::Tag {
+        start: p,
+        name_start,
+        name_end,
+        closing,
+        nested,
+        raw_eligible,
+        image_slot,
+        quote: None,
+        escaped: false,
+        last_non_space: b.get(name_end.wrapping_sub(1)).copied(),
+    });
+    name_end
 }
 
 fn tag_open(b: &[u8], at: usize) -> Option<(usize, usize, bool)> {
@@ -1970,6 +2047,11 @@ fn mark_range(context: &mut [MarkupContext], start: usize, end: usize, kind: Mar
 /// Tokenize markup and template expressions in one forward pass. JS/TS input
 /// arrives with its code literals masked by `mask_js_literals`; template
 /// expressions are scanned here so their strings and comments stay opaque.
+///
+/// A tag or template expression still open `MAX_IMG_TAG_BYTES` past its
+/// opener, or at the end of the file, was never one: the scan resumes just
+/// after the opener in the enclosing mode, so an unclosed quote or brace
+/// cannot hide the rest of the file. Each opener rewinds at most once.
 pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> MarkupContextIndex {
     let b = text.as_bytes();
     let mut context = vec![MarkupContext::Text; b.len()];
@@ -1983,9 +2065,35 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
     let mut images = Vec::new();
     let mut stack = vec![MarkupFrame::Text];
     let mut p = 0usize;
-    while p < b.len() {
+    loop {
+        // JSX arrives with its code literals masked, so a long expression
+        // there (a component body) hides nothing and is not bounded.
+        let opener = match stack.last() {
+            Some(MarkupFrame::Tag { start, .. }) => Some((*start, true)),
+            Some(MarkupFrame::Expression { start, .. }) => Some((*start, !options.jsx)),
+            _ => None,
+        };
+        if let Some((opener, windowed)) = opener {
+            if p >= b.len() || (windowed && p - opener > MAX_IMG_TAG_BYTES) {
+                stack.pop();
+                mark_range(&mut context, opener, p, MarkupContext::Text);
+                images.truncate(images.partition_point(|(start, _)| *start < opener));
+                p = opener + 1;
+                continue;
+            }
+        }
+        if p >= b.len() {
+            break;
+        }
         match stack.last_mut().expect("markup scan has a root frame") {
-            MarkupFrame::Text => {
+            MarkupFrame::Text | MarkupFrame::Children { .. } => {
+                let children = match stack.last() {
+                    Some(MarkupFrame::Children {
+                        name_start,
+                        name_end,
+                    }) => Some((*name_start, *name_end)),
+                    _ => None,
+                };
                 if b.get(p..p + 4) == Some(b"<!--") {
                     let end = b[p + 4..]
                         .windows(3)
@@ -1997,38 +2105,40 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     continue;
                 }
                 if b[p] == b'<' {
-                    if let Some((name_start, name_end, closing)) = tag_open(b, p) {
-                        mark_range(&mut context, p, name_end, MarkupContext::Tag);
-                        let image_slot = (!closing && image_tag_start(b, p)).then(|| {
-                            images.push((p, 0));
-                            images.len() - 1
-                        });
-                        stack.push(MarkupFrame::Tag {
-                            start: p,
-                            name_start,
-                            name_end,
-                            closing,
-                            raw_eligible: options.raw_text,
-                            image_slot,
-                            quote: None,
-                            escaped: false,
-                            last_non_space: b.get(name_end.wrapping_sub(1)).copied(),
-                        });
-                        p = name_end;
+                    if let Some((start, end)) = children {
+                        if start == end && b.get(p..p + 3) == Some(b"</>") {
+                            mark_range(&mut context, p, p + 3, MarkupContext::Tag);
+                            stack.pop();
+                            p += 3;
+                            continue;
+                        }
+                        if b.get(p..p + 2) == Some(b"<>") {
+                            mark_range(&mut context, p, p + 2, MarkupContext::Tag);
+                            stack.push(MarkupFrame::Children {
+                                name_start: p + 1,
+                                name_end: p + 1,
+                            });
+                            p += 2;
+                            continue;
+                        }
+                    }
+                    if let Some(open) = tag_open(b, p) {
+                        p = open_tag_frame(
+                            b,
+                            p,
+                            open,
+                            children.is_some(),
+                            options.raw_text && children.is_none(),
+                            &mut context,
+                            &mut images,
+                            &mut stack,
+                        );
                         continue;
                     }
                 }
                 if options.expressions && b[p] == b'{' {
                     context[p] = MarkupContext::Expression;
-                    stack.push(MarkupFrame::Expression {
-                        depth: 1,
-                        quote: None,
-                        escaped: false,
-                        line_comment: false,
-                        block_comment: false,
-                        regex_can_start: true,
-                        word: Vec::new(),
-                    });
+                    stack.push(expression_frame(p));
                 }
                 p += 1;
             }
@@ -2037,6 +2147,7 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                 name_start,
                 name_end,
                 closing,
+                nested,
                 raw_eligible,
                 image_slot,
                 quote,
@@ -2065,25 +2176,19 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     }
                     b'{' if options.expressions => {
                         context[p] = MarkupContext::Expression;
-                        stack.push(MarkupFrame::Expression {
-                            depth: 1,
-                            quote: None,
-                            escaped: false,
-                            line_comment: false,
-                            block_comment: false,
-                            regex_can_start: true,
-                            word: Vec::new(),
-                        });
+                        stack.push(expression_frame(p));
                         p += 1;
                     }
                     b'>' => {
                         context[p] = MarkupContext::Tag;
                         let tag_start = *start;
                         let tag_end = p + 1;
+                        let (name_start, name_end) = (*name_start, *name_end);
                         let is_closing = *closing;
-                        let is_raw_script =
-                            b[*name_start..*name_end].eq_ignore_ascii_case(b"script");
-                        let is_raw_style = b[*name_start..*name_end].eq_ignore_ascii_case(b"style");
+                        let is_nested = *nested;
+                        let name = &b[name_start..name_end];
+                        let is_raw_script = name.eq_ignore_ascii_case(b"script");
+                        let is_raw_style = name.eq_ignore_ascii_case(b"style");
                         let self_closing = *last_non_space == Some(b'/');
                         if let Some(slot) = image_slot {
                             if tag_end - tag_start <= MAX_IMG_TAG_BYTES
@@ -2094,12 +2199,27 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                         }
                         let enter_raw = *raw_eligible && !is_closing && !self_closing;
                         stack.pop();
-                        if enter_raw && (is_raw_script || is_raw_style) {
+                        if is_closing {
+                            if let Some(MarkupFrame::Children {
+                                name_start: open_start,
+                                name_end: open_end,
+                            }) = stack.last()
+                            {
+                                if b[*open_start..*open_end] == *name {
+                                    stack.pop();
+                                }
+                            }
+                        } else if enter_raw && (is_raw_script || is_raw_style) {
                             stack.push(MarkupFrame::RawText(if is_raw_script {
                                 RawTag::Script
                             } else {
                                 RawTag::Style
                             }));
+                        } else if is_nested && !self_closing && !void_element(name) {
+                            stack.push(MarkupFrame::Children {
+                                name_start,
+                                name_end,
+                            });
                         }
                         p += 1;
                     }
@@ -2126,6 +2246,7 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                 block_comment,
                 regex_can_start,
                 word,
+                ..
             } => {
                 context[p] = MarkupContext::Expression;
                 let c = b[p];
@@ -2208,24 +2329,30 @@ pub(crate) fn scan_markup_context(text: &str, options: MarkupScanOptions) -> Mar
                     *regex_can_start = regex_prefix_keyword(word);
                     word.clear();
                 }
-                if options.jsx && c == b'<' {
-                    if let Some((name_start, name_end, closing)) = tag_open(b, p) {
-                        mark_range(&mut context, p, name_end, MarkupContext::Tag);
-                        stack.push(MarkupFrame::Tag {
-                            start: p,
-                            name_start,
-                            name_end,
-                            closing,
-                            raw_eligible: false,
-                            image_slot: (!closing && image_tag_start(b, p)).then(|| {
-                                images.push((p, 0));
-                                images.len() - 1
-                            }),
-                            quote: None,
-                            escaped: false,
-                            last_non_space: b.get(name_end.wrapping_sub(1)).copied(),
+                // Like a regex, an element starts only where a value can
+                // (`return <img`, `(<img`), not after one (`a<b`).
+                if options.nested_tags && c == b'<' && *regex_can_start {
+                    *regex_can_start = false;
+                    if b.get(p..p + 2) == Some(b"<>") {
+                        mark_range(&mut context, p, p + 2, MarkupContext::Tag);
+                        stack.push(MarkupFrame::Children {
+                            name_start: p + 1,
+                            name_end: p + 1,
                         });
-                        p = name_end;
+                        p += 2;
+                        continue;
+                    }
+                    if let Some(open) = tag_open(b, p) {
+                        p = open_tag_frame(
+                            b,
+                            p,
+                            open,
+                            true,
+                            false,
+                            &mut context,
+                            &mut images,
+                            &mut stack,
+                        );
                         continue;
                     }
                 }
@@ -2326,6 +2453,7 @@ pub(crate) fn find_broken_images(text: &str) -> Vec<MatchCtx> {
         MarkupScanOptions {
             jsx: true,
             expressions: true,
+            nested_tags: true,
             raw_text: true,
             markup: true,
         },
@@ -3390,6 +3518,7 @@ mod tests {
             MarkupScanOptions {
                 jsx: false,
                 expressions: true,
+                nested_tags: false,
                 raw_text: true,
                 markup: true,
             },
@@ -3406,6 +3535,7 @@ mod tests {
             MarkupScanOptions {
                 jsx: true,
                 expressions: true,
+                nested_tags: true,
                 raw_text: false,
                 markup: true,
             },

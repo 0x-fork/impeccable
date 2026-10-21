@@ -10,6 +10,10 @@ fn source_images_distinguish_markup_from_bindings_and_code_literals() {
         ("TooltipMultiline.svelte", include_str!("fixtures/broken-image/tooltip-multiline.svelte"), &[]),
         ("TooltipSameLine.svelte", include_str!("fixtures/broken-image/tooltip-same-line.svelte"), &[]),
         ("View.astro", include_str!("fixtures/broken-image/shorthand.astro"), &[4]),
+        // Elements nested in an expression, with apostrophes in their text.
+        ("List.astro", include_str!("fixtures/broken-image/expressions.astro"), &[4, 5]),
+        // An unclosed attribute quote does not hide the rest of the file.
+        ("oops.html", include_str!("fixtures/broken-image/unclosed-quote.html"), &[3]),
         ("View.vue", include_str!("fixtures/broken-image/bindings.vue"), &[7, 8]),
         ("index.html", include_str!("fixtures/broken-image/missing.html"), &[1, 2, 3, 4, 5, 7, 9, 11, 18]),
         ("markers.ts", include_str!("fixtures/broken-image/literals.js"), &[]),
@@ -18,6 +22,8 @@ fn source_images_distinguish_markup_from_bindings_and_code_literals() {
         ("markers.cjs", include_str!("fixtures/broken-image/literals.js"), &[]),
         ("View.jsx", include_str!("fixtures/broken-image/elements.jsx"), &[5, 6, 11, 14, 18, 19, 21, 29]),
         ("View.tsx", include_str!("fixtures/broken-image/elements.jsx"), &[5, 6, 11, 14, 18, 19, 21, 29]),
+        // JSX children text (`Don't`, a URL, `and/or`) is text, not code.
+        ("Body.tsx", include_str!("fixtures/broken-image/children-text.tsx"), &[7, 10]),
     ];
     for &(path, source, expected) in cases {
         let findings = detect_text(source, path, &TextOptions::default());
