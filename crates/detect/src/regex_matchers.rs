@@ -1891,13 +1891,15 @@ fn in_js_string(b: &[u8]) -> bool {
     quote.is_some()
 }
 
-/// A candidate inside an earlier tag's quoted attribute on its line is text;
-/// one in a JSX attribute expression is a real nested element.
-fn hidden_in_parent_tag(line: &[u8], at: usize) -> bool {
+/// A candidate inside the quoted attribute of an earlier tag on its line is
+/// text, even when the quote closes on a later line; one in a JSX attribute
+/// expression is a real nested element.
+fn hidden_in_parent_tag(text: &[u8], at: usize) -> bool {
+    let window = &text[..text.len().min(at + MAX_IMG_TAG_BYTES)];
     let mut i = 0;
     while i < at {
-        if line[i] == b'<' && line.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
-            match scan_markup_tag(line, i, Some(at)) {
+        if text[i] == b'<' && text.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            match scan_markup_tag(window, i, Some(at)) {
                 TagScan::Hidden => return true,
                 TagScan::Visible => return false,
                 TagScan::End(end) => {
@@ -1921,7 +1923,7 @@ pub(crate) fn find_broken_images(text: &str) -> Vec<MatchCtx> {
     let mut pos = 0;
     while let Some(m) = IMG_OPEN_RE.find_at(line, pos) {
         pos = m.end();
-        if hidden_in_parent_tag(line.as_bytes(), m.start()) { continue; }
+        if hidden_in_parent_tag(b, m.start()) { continue; }
         let window = &b[..b.len().min(m.start() + MAX_IMG_TAG_BYTES)];
         let TagScan::End(end) = scan_markup_tag(window, m.start(), None) else { continue; };
         pos = (end + 1).min(line.len());
