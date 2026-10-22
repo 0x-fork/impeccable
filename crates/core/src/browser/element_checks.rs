@@ -2845,6 +2845,18 @@ fn gradient_ancestor_average(dom: &dyn Dom, start: Option<ElId>) -> Option<Rgba>
     None
 }
 
+pub fn check_element_hard_offset_shadow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
+    let box_shadow = dom.style(el, "boxShadow");
+    if !crate::checks::hard_offset_shadow::has_shadow(&box_shadow) {
+        return Vec::new();
+    }
+    crate::checks::hard_offset_shadow::check_hard_offset_shadow(
+        &box_shadow,
+        &dom.style(el, "color"),
+        effective_opacity_dom(dom, el),
+    )
+}
+
 /// The stops of the gradient [`gradient_ancestor_average`] finds, when every
 /// stop is opaque and no picture is layered with it; empty otherwise.
 fn gradient_ancestor_stops(dom: &dyn Dom, start: Option<ElId>) -> Vec<Rgba> {
