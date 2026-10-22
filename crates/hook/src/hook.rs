@@ -57,6 +57,9 @@ fn session_id_of(event: &Map<String, Value>) -> Option<Value> {
         .cloned()
 }
 
+/// Cursor's cap on a hook's `additional_context` (characters, after trim).
+const CURSOR_ADDITIONAL_CONTEXT_MAX_CHARS: f64 = 10_000.0;
+
 fn session_key(v: &Option<Value>) -> String {
     match v {
         Some(v) => crate::util::js_string(v),
@@ -113,6 +116,7 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
     };
 
     let harness = resolve_harness(rt, Some(&event));
+    let raw_event = event.clone();
     let event = normalize_hook_event(rt, &event, &rt.proc_cwd, harness);
     audit.insert("harness".into(), Value::from(harness));
 
@@ -145,7 +149,13 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
         );
     }
 
-    let config = read_config(&project_cwd);
+    let mut config = read_config(&project_cwd);
+    if harness == "cursor" {
+        // Cursor rejects a postToolUse `additional_context` longer than
+        // 10,000 characters and drops it, so a raised `limits.maxChars`
+        // must not push the findings past that.
+        config.limits.max_chars = config.limits.max_chars.min(CURSOR_ADDITIONAL_CONTEXT_MAX_CHARS);
+    }
     if !config.enabled {
         return result(
             &audit,
@@ -163,6 +173,18 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
             vec![
                 ("skipped", Value::from("native-platform")),
                 ("platform", Value::String(platform.unwrap_or_default())),
+                ("durationMs", ms_since(started)),
+            ],
+        );
+    }
+
+    // Several Impeccable hooks can fire for one edit (home and project
+    // manifests, a plugin and a project hook): only the first scans.
+    if crate::hook_claim::claim_event(rt, &raw_event, &project_cwd, &primary_files) == crate::hook_claim::Claim::Duplicate {
+        return result(
+            &audit,
+            vec![
+                ("skipped", Value::from("duplicate-event")),
                 ("durationMs", ms_since(started)),
             ],
         );

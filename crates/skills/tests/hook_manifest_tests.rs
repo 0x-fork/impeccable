@@ -132,14 +132,62 @@ fn codex_gets_command_windows_sibling_pointing_at_cmd_shim() {
 }
 
 #[test]
-fn cursor_runs_hook_before_edit() {
-    let bundle = json!({ "version": 1, "hooks": { "preToolUse": [{ "command": "node \".cursor/skills/impeccable/scripts/hook-before-edit.mjs\"", "timeout": 5 }] } });
+fn cursor_runs_the_post_edit_hook() {
+    let bundle = json!({ "version": 1, "hooks": { "postToolUse": [{ "command": "[ ! -f \".cursor/skills/impeccable/scripts/impeccable\" ] || \".cursor/skills/impeccable/scripts/impeccable\" hook", "matcher": "^Write$", "timeout": 5 }] } });
     let out = rewrite_hook_commands_for_platform(&bundle, ".cursor", "/proj", false, false);
-    assert_eq!(
-        out["hooks"]["preToolUse"][0]["command"],
-        "[ ! -f \".cursor/skills/impeccable/scripts/impeccable\" ] || \".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit"
-    );
-    assert!(out["hooks"]["preToolUse"][0].get("commandWindows").is_none());
+    assert_eq!(out, bundle);
+    assert!(out["hooks"]["postToolUse"][0].get("commandWindows").is_none());
+}
+
+const CURSOR_POST_EDIT: &str = "[ ! -f \".cursor/skills/impeccable/scripts/impeccable\" ] || \".cursor/skills/impeccable/scripts/impeccable\" hook";
+
+#[test]
+fn repair_moves_the_retired_cursor_gate_in_both_spellings() {
+    for gate in [
+        "[ ! -f \".cursor/skills/impeccable/scripts/impeccable\" ] || \".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit",
+        "node \".cursor/skills/impeccable/scripts/hook-before-edit.mjs\"",
+    ] {
+        let home = tmp_dir("cursor-gate-home").to_string_lossy().to_string();
+        let proj = tmp_dir("cursor-gate-proj").to_string_lossy().to_string();
+        let sys = sys_with_home(&home);
+        let manifest = format!("{proj}/.cursor/hooks.json");
+        write(&manifest, &json!({ "version": 1, "hooks": {
+            "preToolUse": [{ "command": "./audit.sh", "matcher": "Shell" }, { "command": gate, "timeout": 5 }],
+        } }).to_string());
+
+        assert_eq!(repair_stale_hook_manifests(&sys, &proj, &[".cursor"], None).unwrap(), [".cursor"], "{gate}");
+
+        let after: Value = serde_json::from_str(&read(&manifest)).unwrap();
+        assert_eq!(after, json!({ "version": 1, "hooks": {
+            "preToolUse": [{ "command": "./audit.sh", "matcher": "Shell" }],
+            "postToolUse": [{ "command": CURSOR_POST_EDIT, "matcher": "^Write$", "timeout": 5 }],
+        } }), "{gate}");
+        // Idempotent.
+        assert!(repair_stale_hook_manifests(&sys, &proj, &[".cursor"], None).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&proj);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
+fn install_from_an_older_bundle_never_runs_the_post_edit_verb_before_the_edit() {
+    let dir = tmp_dir("cursor-old-bundle");
+    let root = dir.to_string_lossy().into_owned();
+    let bundle = jsp::join(&[&root, "bundle"]);
+    let project = jsp::join(&[&root, "project"]);
+    write(&jsp::join(&[&bundle, ".cursor", "hooks.json"]), &json!({ "version": 1, "hooks": { "preToolUse": [{
+        "command": "[ ! -f \".cursor/skills/impeccable/scripts/impeccable\" ] || \".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit",
+        "timeout": 5,
+    }] } }).to_string());
+    let sys = sys_with_home("/nonexistent-home");
+
+    copy_provider_hooks(&sys, &bundle, &project, &[".cursor"], false, None, None).unwrap();
+
+    let after: Value = serde_json::from_str(&read(&jsp::join(&[&project, ".cursor", "hooks.json"]))).unwrap();
+    assert_eq!(after, json!({ "version": 1, "hooks": {
+        "postToolUse": [{ "command": CURSOR_POST_EDIT, "matcher": "^Write$", "timeout": 5 }],
+    } }));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

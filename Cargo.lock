@@ -680,6 +680,7 @@ dependencies = [
  "impeccable-context",
  "impeccable-core",
  "impeccable-detect",
+ "libc",
  "once_cell",
  "regex",
  "serde_json",

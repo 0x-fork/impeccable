@@ -114,6 +114,11 @@ const sidecarOlder = (ws) => { touch(path.join(ws, 'DESIGN.md'), T_NEW); touch(p
 
 // ctx-legacy carries `.impeccable-live.json` (gitignored in this repo, so it
 // is written at stage time) and a DESIGN.md newer than its legacy sidecar.
+const cursorGateSetup = (ws) => {
+  write(ws, '.cursor/skills/impeccable/scripts/impeccable', '#!/bin/sh\n');
+  write(ws, '.cursor/hooks.json', JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: '[ ! -f ".cursor/skills/impeccable/scripts/impeccable" ] || ".cursor/skills/impeccable/scripts/impeccable" hook-before-edit', timeout: 5 }] } }, null, 2) + '\n');
+};
+
 const legacySetup = (ws) => {
   write(ws, '.impeccable-live.json', JSON.stringify({ port: 4310, sessions: [] }, null, 2) + '\n');
   sidecarOlder(ws);
@@ -457,6 +462,10 @@ const cases = [
   { id: 'doctor-monorepo-roots-match-nothing', verb: 'doctor', workspace: 'ctx-monorepo', setup: (ws) => write(ws, '.impeccable/config.json', JSON.stringify({ projectRoots: ['services/*'] }, null, 2) + '\n'), env: env() },
   { id: 'doctor-legacy-text', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-json', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--json'], env: env(), files: IMPECCABLE_FILES },
+  // A Cursor manifest still on the retired preToolUse gate is an `auto`
+  // finding; --fix moves the entry to postToolUse in place.
+  { id: 'doctor-cursor-gate-json', verb: 'doctor', workspace: 'ctx-product-only', setup: cursorGateSetup, args: ['--json'], env: env({ IMPECCABLE_PROVIDER_ID: 'cursor' }), files: ['.cursor/hooks.json'] },
+  { id: 'doctor-cursor-gate-fix', verb: 'doctor', workspace: 'ctx-product-only', setup: cursorGateSetup, args: ['--fix'], env: env({ IMPECCABLE_PROVIDER_ID: 'cursor' }), files: ['.cursor/hooks.json'] },
   { id: 'doctor-legacy-fix', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix'], env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-fix-json', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix', '--json'], env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-fix-twice', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix'], env: env(), files: IMPECCABLE_FILES, steps: [{}, {}, { args: ['--json'] }] },

@@ -462,6 +462,61 @@ fn check_monorepo_design_hook(mode: &str) {
     }
 }
 
+/// A Cursor `postToolUse` envelope as Cursor 3.21 builds it for an agent
+/// file edit (cursor-agent-exec: base request + `tool_name`, `tool_input`,
+/// `tool_output`, `duration`, `tool_use_id`).
+fn cursor_post_tool_use(cwd: &str, file: &str, content: &str) -> String {
+    json!({
+        "conversation_id": "cv-post", "generation_id": "gen-1", "session_id": "cv-post",
+        "hook_event_name": "postToolUse", "cursor_version": "3.21.18",
+        "workspace_roots": [cwd], "user_email": "dev@example.com", "transcript_path": null,
+        "model": "composer-2",
+        "tool_name": "Write", "tool_input": { "file_path": file, "content": content },
+        "tool_output": "{}", "duration": 12, "tool_use_id": "tool-1",
+    })
+    .to_string()
+}
+
+#[test]
+fn cursor_post_tool_use_feeds_findings_back_as_additional_context() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let r = rt(&cwd);
+
+    let res = hook::run_hook(&r, &cursor_post_tool_use(&cwd, &file, SIDE_TAB_CSS));
+
+    let out: Value = serde_json::from_str(&res.stdout).unwrap_or_else(|_| panic!("{}", res.stdout));
+    let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+    assert_eq!(keys, vec!["additional_context"], "{}", res.stdout);
+    let text = out["additional_context"].as_str().unwrap();
+    assert!(text.contains("side-tab"), "{text}");
+    // Un-tiered: Cursor has no Stop deep pass, so nothing is deferred.
+    assert!(res.audit.get("deferred").is_none_or(|v| v == &json!(0)), "{:?}", res.audit);
+}
+
+#[test]
+fn cursor_additional_context_stays_under_cursors_cap() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    t.write(".impeccable/config.json", r#"{"hook":{"perEditRules":"all","limits":{"maxChars":50000,"maxFindings":1000}}}"#);
+    let css: String = (0..400)
+        .map(|i| format!(".c{i} {{ border-left: 4px solid #6366f1; border-radius: 8px; background: linear-gradient(90deg, #f472b6, #a78bfa); -webkit-background-clip: text; color: transparent; }}\n"))
+        .collect();
+    let file = t.write("src/many.css", &css);
+    let r = rt(&cwd);
+
+    let res = hook::run_hook(&r, &cursor_post_tool_use(&cwd, &file, &css));
+
+    let out: Value = serde_json::from_str(&res.stdout).unwrap();
+    let text = out["additional_context"].as_str().unwrap();
+    assert!(text.encode_utf16().count() <= 10_000, "{}", text.len());
+    // The same edit through Claude's envelope is not clamped, so the cap is
+    // what kept Cursor's text short.
+    let claude = hook::run_hook(&rt(&cwd), &edit_event(&cwd, &file, "s-claude"));
+    assert!(claude.stdout.len() > 10_000, "{}", claude.stdout.len());
+}
+
 #[test]
 fn monorepo_design_post_edit() { check_monorepo_design_hook("post"); }
 
@@ -2326,8 +2381,12 @@ fn admin_on_writes_launcher_manifests_for_every_harness() {
 
     let cursor: Value = serde_json::from_str(&t.read(".cursor/hooks.json")).unwrap();
     assert_eq!(
-        cursor["hooks"]["preToolUse"][0]["command"],
-        json!("\".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit")
+        cursor,
+        json!({"version": 1, "hooks": {"postToolUse": [{
+            "command": "\".cursor/skills/impeccable/scripts/impeccable\" hook",
+            "matcher": "^Write$",
+            "timeout": 5,
+        }]}})
     );
     let github: Value = serde_json::from_str(&t.read(".github/hooks/impeccable.json")).unwrap();
     assert_eq!(
@@ -2517,6 +2576,38 @@ fn admin_on_replaces_legacy_user_hook_before_pruning_project_hook() {
     assert_eq!(command, expected_user_claude_hook_command(&home_text));
     let local: Value = serde_json::from_str(&t.read(".claude/settings.local.json")).unwrap();
     assert!(local.get("hooks").is_none(), "duplicate project hook survived: {local}");
+}
+
+#[test]
+fn admin_on_moves_the_retired_cursor_gate_to_post_tool_use() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let r = rt(&cwd);
+    std::fs::create_dir_all(t.0.join(".cursor/skills/impeccable")).unwrap();
+    // A pre-migration manifest: the gate on preToolUse beside a foreign hook
+    // on the same event and another on a different one.
+    t.write(
+        ".cursor/hooks.json",
+        r#"{"version":1,"hooks":{"preToolUse":[{"command":"./audit.sh","matcher":"Shell"},{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit","timeout":5}],"stop":[{"command":"./notify.sh"}]}}"#,
+    );
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Installed or repaired hook manifests for: .cursor."), "{out}");
+    let cursor: Value = serde_json::from_str(&t.read(".cursor/hooks.json")).unwrap();
+    assert_eq!(
+        cursor,
+        json!({"version": 1, "hooks": {
+            "preToolUse": [{"command": "./audit.sh", "matcher": "Shell"}],
+            "stop": [{"command": "./notify.sh"}],
+            "postToolUse": [{
+                "command": "\".cursor/skills/impeccable/scripts/impeccable\" hook",
+                "matcher": "^Write$",
+                "timeout": 5,
+            }],
+        }})
+    );
 }
 
 #[test]
@@ -2906,5 +2997,257 @@ fn run_hook_stands_down_before_the_edit_cap_can_suppress_a_live_file() {
         assert_eq!(out.audit["skipped"], json!("live-preview"), "edit {i}");
         assert!(out.audit.get("suppressed").is_none(), "edit {i}: {:?}", out.audit);
         assert!(out.audit.get("editCount").is_none(), "edit {i}: the cap is not bumped for a live wrap");
+    }
+}
+
+// ─── One scan per edit event (hook_claim) ────────────────────────────────────
+
+fn claim_env(t: &Tmp, extra: &[(&str, &str)]) -> HashMap<String, String> {
+    let mut e = env(extra);
+    e.insert("IMPECCABLE_HOOK_CLAIM_DIR".into(), jsp::join(&[&t.path(), "claims"]));
+    e
+}
+
+fn codex_post_tool_use(cwd: &str, file: &str, call: &str) -> String {
+    json!({
+        "session_id": "codex-s", "turn_id": "turn-1", "cwd": cwd, "hook_event_name": "PostToolUse",
+        "model": "gpt-5", "tool_name": "apply_patch", "tool_use_id": call,
+        "tool_input": { "file_path": file },
+    })
+    .to_string()
+}
+
+fn claude_post_tool_use(cwd: &str, file: &str, call: &str) -> String {
+    json!({
+        "session_id": "claude-s", "cwd": cwd, "hook_event_name": "PostToolUse",
+        "tool_name": "Edit", "tool_use_id": call, "tool_input": { "file_path": file },
+    })
+    .to_string()
+}
+
+fn scanned(res: &hook::RunResult) -> bool {
+    res.audit.get("skipped") != Some(&json!("duplicate-event"))
+}
+
+#[test]
+fn concurrent_duplicate_invocations_of_one_event_scan_once() {
+    for (harness, payload) in [
+        ("cursor", cursor_post_tool_use as fn(&str, &str, &str) -> String),
+        ("codex", |cwd: &str, file: &str, _c: &str| codex_post_tool_use(cwd, file, "call-1")),
+        ("claude", |cwd: &str, file: &str, _c: &str| claude_post_tool_use(cwd, file, "toolu_1")),
+    ] {
+        let t = Tmp::new();
+        let cwd = t.path();
+        let file = t.write("src/card.css", SIDE_TAB_CSS);
+        let stdin = payload(&cwd, &file, SIDE_TAB_CSS);
+        let e = claim_env(&t, &[]);
+        let results: Vec<hook::RunResult> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let (cwd, e, stdin) = (cwd.clone(), e.clone(), stdin.clone());
+                    s.spawn(move || hook::run_hook(&rt_with(&cwd, e), &stdin))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let scans: Vec<&hook::RunResult> = results.iter().filter(|r| scanned(r)).collect();
+        assert_eq!(scans.len(), 1, "{harness}: {:?}", results.iter().map(|r| &r.audit).collect::<Vec<_>>());
+        assert!(scans[0].audit.contains_key("findings") && !scans[0].stdout.is_empty(), "{harness}: {:?}", scans[0].audit);
+        for r in results.iter().filter(|r| !scanned(r)) {
+            assert!(r.stdout.is_empty(), "{harness}: a duplicate printed {}", r.stdout);
+        }
+    }
+}
+
+#[test]
+fn different_edit_events_each_scan() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let other = t.write("src/other.css", SIDE_TAB_CSS);
+    let e = claim_env(&t, &[]);
+    let first = hook::run_hook(&rt_with(&cwd, e.clone()), &claude_post_tool_use(&cwd, &file, "toolu_1"));
+    let next_call = hook::run_hook(&rt_with(&cwd, e.clone()), &claude_post_tool_use(&cwd, &file, "toolu_2"));
+    let other_file = hook::run_hook(&rt_with(&cwd, e.clone()), &codex_post_tool_use(&cwd, &other, "toolu_1"));
+    for res in [&first, &next_call, &other_file] {
+        assert!(scanned(res) && res.audit.contains_key("findings"), "{:?}", res.audit);
+    }
+}
+
+/// A plugin's hook command sets the harness itself, the project manifest's
+/// does not; both receive the same event, so only one scans.
+#[test]
+fn plugin_and_project_hooks_for_one_codex_event_scan_once() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let stdin = codex_post_tool_use(&cwd, &file, "call-7");
+    let plugin = hook::run_hook(&rt_with(&cwd, claim_env(&t, &[("IMPECCABLE_HOOK_HARNESS", "codex")])), &stdin);
+    let project = hook::run_hook(&rt_with(&cwd, claim_env(&t, &[])), &stdin);
+    assert!(scanned(&plugin) && plugin.audit.contains_key("findings"), "{:?}", plugin.audit);
+    assert!(!scanned(&project) && project.stdout.is_empty(), "{:?}", project.audit);
+}
+
+/// No tool-call id: nothing to tell a duplicate from a real second edit by,
+/// so every invocation scans, as before.
+#[test]
+fn events_without_a_tool_call_id_are_never_claimed() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let e = claim_env(&t, &[]);
+    for _ in 0..2 {
+        let res = hook::run_hook(&rt_with(&cwd, e.clone()), &edit_event(&cwd, &file, "s-noid"));
+        assert!(scanned(&res), "{:?}", res.audit);
+    }
+}
+
+/// The claim fails open: an unusable claim dir means scan, never skip.
+#[test]
+fn an_unusable_claim_dir_still_scans() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let blocker = t.write("claims-file", "not a dir");
+    let mut e = env(&[]);
+    e.insert("IMPECCABLE_HOOK_CLAIM_DIR".into(), jsp::join(&[&blocker, "nested"]));
+    let stdin = claude_post_tool_use(&cwd, &file, "toolu_9");
+    for _ in 0..2 {
+        let res = hook::run_hook(&rt_with(&cwd, e.clone()), &stdin);
+        assert!(scanned(&res) && res.audit.contains_key("findings"), "{:?}", res.audit);
+    }
+}
+
+#[test]
+fn claim_keys_are_path_safe_and_separator_independent_of_the_platform() {
+    let ev: Map<String, Value> = serde_json::from_value(json!({ "session_id": "s", "tool_use_id": "t" })).unwrap();
+    let key = impeccable_hook::hook_claim::event_key(&ev, r"C:\Users\dev\proj", &[r"C:\Users\dev\proj\src\a.css".into()]).unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    let ev_none: Map<String, Value> = serde_json::from_value(json!({ "session_id": "s" })).unwrap();
+    assert!(impeccable_hook::hook_claim::event_key(&ev_none, "/p", &[]).is_none());
+}
+
+// ─── Claim storage safety (#1069 review: shared temp roots) ──────────────────
+
+const OLD_CLAIM: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+/// A claim root that is a symlink (say one another user planted) is never
+/// followed: nothing behind it is created or deleted, and both hooks scan.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_claim_root_is_never_followed() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    t.write("victim/2024/keep.txt", "mine");
+    t.write(&format!("victim/1/{OLD_CLAIM}"), "");
+    let victim = jsp::join(&[&cwd, "victim"]);
+    let link = jsp::join(&[&cwd, "claims-link"]);
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let mut e = env(&[]);
+    e.insert("IMPECCABLE_HOOK_CLAIM_DIR".into(), link.clone());
+    let stdin = claude_post_tool_use(&cwd, &file, "toolu_link");
+    for _ in 0..2 {
+        let res = hook::run_hook(&rt_with(&cwd, e.clone()), &stdin);
+        assert!(scanned(&res) && res.audit.contains_key("findings"), "{:?}", res.audit);
+    }
+    assert!(t.exists("victim/2024/keep.txt"));
+    assert!(t.exists(&format!("victim/1/{OLD_CLAIM}")));
+    let names: Vec<String> = std::fs::read_dir(&victim).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+/// A root other users can write to is not trusted either.
+#[test]
+#[cfg(unix)]
+fn a_group_or_world_writable_claim_root_is_not_used() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let root = jsp::join(&[&cwd, "claims"]);
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let stdin = claude_post_tool_use(&cwd, &file, "toolu_open");
+    for _ in 0..2 {
+        let res = hook::run_hook(&rt_with(&cwd, claim_env(&t, &[])), &stdin);
+        assert!(scanned(&res), "{:?}", res.audit);
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+/// The sweep removes only old `<digits>/` buckets and only `<64 hex>` claim
+/// files in them. Foreign names, foreign files and symlinks stay.
+#[test]
+fn the_sweep_removes_only_its_own_old_buckets_and_claims() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let root = jsp::join(&[&cwd, "claims"]);
+    t.write(&format!("claims/2/{OLD_CLAIM}"), "");
+    t.write(&format!("claims/1/{OLD_CLAIM}"), "");
+    t.write("claims/1/readme.txt", "not ours");
+    t.write("claims/notes/todo.txt", "not ours");
+    t.write(&format!("outside/{OLD_CLAIM}"), "");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(jsp::join(&[&cwd, "outside"]), jsp::join(&[&root, "3"])).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for d in ["claims", "claims/1", "claims/2", "claims/notes"] {
+            std::fs::set_permissions(jsp::join(&[&cwd, d]), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    let res = hook::run_hook(&rt_with(&cwd, claim_env(&t, &[])), &claude_post_tool_use(&cwd, &file, "toolu_sweep"));
+    assert!(scanned(&res), "{:?}", res.audit);
+
+    assert!(!t.exists("claims/2"), "an old bucket of claims only is removed");
+    assert!(t.exists("claims/1/readme.txt") && !t.exists(&format!("claims/1/{OLD_CLAIM}")));
+    assert!(t.exists("claims/notes/todo.txt"));
+    assert!(t.exists(&format!("outside/{OLD_CLAIM}")), "a symlinked bucket is not followed");
+    // And the normal path still dedupes.
+    let again = hook::run_hook(&rt_with(&cwd, claim_env(&t, &[])), &claude_post_tool_use(&cwd, &file, "toolu_sweep"));
+    assert!(!scanned(&again), "{:?}", again.audit);
+}
+
+/// Without an override the claims sit under the user's home, not in the
+/// shared temp dir.
+#[test]
+fn claims_default_to_the_users_home() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let file = t.write("src/card.css", SIDE_TAB_CSS);
+    let home = jsp::join(&[&cwd, "home"]);
+    std::fs::create_dir(&home).unwrap();
+    let e = env(&[("HOME", &home), ("USERPROFILE", &home)]);
+    let stdin = claude_post_tool_use(&cwd, &file, "toolu_home");
+    let first = hook::run_hook(&rt_with(&cwd, e.clone()), &stdin);
+    let second = hook::run_hook(&rt_with(&cwd, e.clone()), &stdin);
+    assert!(scanned(&first) && !scanned(&second));
+    assert!(t.exists("home/.impeccable/hook-claims"));
+}
+
+/// The first edit in a fresh home: concurrent hooks race to create
+/// `~/.impeccable`, and the loser must still claim rather than scan.
+#[test]
+fn concurrent_first_edits_in_a_fresh_home_scan_once() {
+    for round in 0..8 {
+        let t = Tmp::new();
+        let cwd = t.path();
+        let file = t.write("src/card.css", SIDE_TAB_CSS);
+        let home = jsp::join(&[&cwd, "home"]);
+        std::fs::create_dir(&home).unwrap();
+        let e = env(&[("HOME", &home), ("USERPROFILE", &home)]);
+        let stdin = claude_post_tool_use(&cwd, &file, "toolu_fresh");
+        let barrier = std::sync::Barrier::new(4);
+        let scans = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| { barrier.wait(); scanned(&hook::run_hook(&rt_with(&cwd, e.clone()), &stdin)) }))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).filter(|scanned| *scanned).count()
+        });
+        assert_eq!(scans, 1, "round {round}");
     }
 }

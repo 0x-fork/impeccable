@@ -282,6 +282,20 @@ pub fn check_hook_installation(
                 !exists(&abs)
             })
             .collect();
+        if provider_id == "cursor" && crate::hook_markers::cursor_manifest_has_retired_gate(&raw) {
+            let ia = installed_at.clone().unwrap();
+            out.push(finding(
+                "cursor-hook-pre-edit-gate",
+                "hook manifest",
+                Some(ia.clone()),
+                "auto",
+                format!(
+                    "{} still runs the design hook as Cursor's `preToolUse` write gate, which is retired. Cursor now runs it after each edit on `postToolUse` and hands the findings to the agent as context.",
+                    ia
+                ),
+                "Move the entry to `postToolUse`: `impeccable doctor --fix`, `impeccable hooks on`, or the next `impeccable update` does it.".to_string(),
+            ));
+        }
         if !broken.is_empty() {
             let ia = installed_at.clone().unwrap();
             out.push(finding(
@@ -514,6 +528,20 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         write(&root, ".claude/skills/impeccable/scripts/hook.mjs", "");
         assert!(check_hook_installation(&root, None, "claude-code", None).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_gate_is_an_auto_finding_and_the_post_edit_hook_is_not() {
+        let root = tmp();
+        write(&root, ".cursor/skills/impeccable/scripts/impeccable", "#!/bin/sh\n");
+        write(&root, ".cursor/hooks.json", r#"{"version":1,"hooks":{"preToolUse":[{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit","timeout":5}]}}"#);
+        let f = check_hook_installation(&root, None, "cursor", None);
+        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|x| &x.id).collect::<Vec<_>>());
+        assert_eq!(f[0].id, "cursor-hook-pre-edit-gate");
+        assert_eq!(f[0].severity, "auto");
+        write(&root, ".cursor/hooks.json", r#"{"version":1,"hooks":{"postToolUse":[{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook","matcher":"^Write$","timeout":5}]}}"#);
+        assert!(check_hook_installation(&root, None, "cursor", None).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

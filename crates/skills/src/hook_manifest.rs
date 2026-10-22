@@ -6,7 +6,7 @@
 //! Where the JS wrote `[ ! -f "<skill>/scripts/hook.mjs" ] || node
 //! "<skill>/scripts/hook.mjs"` (and a `node -e` guard on Windows), the binary
 //! writes the launcher form `[ ! -f "<skill>/scripts/impeccable" ] ||
-//! "<skill>/scripts/impeccable" hook` (`hook-before-edit` for Cursor), the
+//! "<skill>/scripts/impeccable" hook` (Cursor included, on `postToolUse`), the
 //! shape the public build's `transformers/hooks.js` puts in the bundle; the
 //! Codex `commandWindows` sibling and a Windows Grok `command` run
 //! `impeccable.cmd` behind `cmd /c if exist`.
@@ -17,7 +17,7 @@
 //! `impeccable_context::hook_markers::is_impeccable_hook_command`, so the two
 //! writers and the three readers can never disagree on what counts as ours.
 
-use impeccable_context::hook_markers::{is_impeccable_hook_command, is_launcher_hook_command, parse_manifest_jsonc, windows_launcher_hook_command};
+use impeccable_context::hook_markers::{cursor_hook_manifest, cursor_manifest_has_retired_gate, is_impeccable_hook_command, is_launcher_hook_command, parse_manifest_jsonc, windows_launcher_hook_command};
 use serde_json::{Map, Value};
 
 use crate::providers::Sys;
@@ -91,15 +91,30 @@ pub fn expected_hook_dests(root: &str, providers: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The hook verb the launcher runs for a provider (JS: the `hook.mjs` /
-/// `hook-before-edit.mjs` choice in hookScriptRelPathForProvider).
-pub fn hook_verb(provider: &str) -> &'static str {
-    if provider == ".cursor" {
-        "hook-before-edit"
-    } else {
-        "hook"
-    }
+/// The hook verb the launcher runs for a provider. Every harness runs the
+/// post-edit `hook` verb; Cursor used to run `hook-before-edit` on
+/// `preToolUse`, and `migrate_cursor_gate` moves those manifests over.
+pub fn hook_verb(_provider: &str) -> &'static str {
+    "hook"
 }
+
+/// Moves a Cursor manifest off the retired `preToolUse` before-edit gate:
+/// drops Impeccable entries from every event (other tools' hooks stay) and
+/// adds the post-edit `postToolUse` entry, its command rewritten for the
+/// install. A manifest without the gate is returned unchanged, so this is
+/// safe to run after any write.
+pub fn migrate_cursor_gate(value: &Value, skill_root: &str, absolute: bool) -> Value {
+    if !cursor_manifest_has_retired_gate(value) {
+        return value.clone();
+    }
+    // Any launcher-form command carries the marker the rewrite replaces.
+    let template = cursor_hook_manifest("\".cursor/skills/impeccable/scripts/impeccable\" hook", CURSOR_TIMEOUT_SECONDS);
+    let fresh = rewrite_hook_commands_for_skill_root(&template, ".cursor", skill_root, absolute);
+    merge_hook_manifests(value, &fresh)
+}
+
+/// Cursor's per-edit hook timeout, in seconds (the bundle's TIMEOUT_SECONDS).
+const CURSOR_TIMEOUT_SECONDS: i64 = 5;
 
 /// JS: hookScriptRelPathForProvider(provider), for the launcher: the
 /// project-relative launcher path (Claude keeps its `${CLAUDE_PROJECT_DIR}`
@@ -299,6 +314,17 @@ pub fn manifest_has_stale_hook(file: &str) -> bool {
         Some(h @ (Value::Object(_) | Value::Array(_))) => value_has_impeccable_hook_marker(h) && !value_has_launcher_hook_marker(h),
         _ => false,
     }
+}
+
+/// True when a Cursor manifest on disk still runs the retired `preToolUse`
+/// before-edit gate (either generation's spelling).
+pub fn manifest_has_retired_cursor_gate(file: &str) -> bool {
+    if !util::exists(file) {
+        return false;
+    }
+    let Ok(text) = util::read_text(file) else { return false };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else { return false };
+    cursor_manifest_has_retired_gate(&parsed)
 }
 
 /// JS: fileHasImpeccableHookMarker(file): parse and scan only the `hooks`
@@ -571,6 +597,12 @@ pub fn copy_provider_hooks(sys: &crate::providers::Sys, bundle_dir: &str, root: 
                     }
                 }
             }
+            if *provider == ".cursor" {
+                // An older bundle can still carry the retired `preToolUse`
+                // gate; the verb rewrite above would point it at `hook`, which
+                // must run after the edit, not before it.
+                next = migrate_cursor_gate(&next, skill_root, absolute);
+            }
             util::mkdir_p(&jsp::dirname(&artifact.dest))?;
             // Atomic: in user scope this is the user's whole Claude settings file.
             impeccable_common::fsx::write_atomic(&artifact.dest, format!("{}\n", util::json_pretty(&next)).as_bytes()).map_err(|e| util::node_error("open", &artifact.dest, &e))?;
@@ -614,7 +646,11 @@ pub fn prune_duplicate_claude_hooks(sys: &crate::providers::Sys, home_root: &str
 /// skipped. `.github` (and any provider with no rewritable launcher path)
 /// carries a portable, team-committed command form that must not be pinned to
 /// a machine-local path here; its migration rides the bundle-merge path in
-/// `copy_provider_hooks` instead. Returns the providers whose manifest changed.
+/// `copy_provider_hooks` instead. A Cursor manifest that still runs the retired
+/// `preToolUse` before-edit gate is migrated here too (`migrate_cursor_gate`),
+/// in either spelling, so an update moves it to the post-edit hook whether or
+/// not the user re-consents to hooks. Returns the providers whose manifest
+/// changed.
 pub fn repair_stale_hook_manifests(sys: &Sys, root: &str, providers: &[&'static str], skill_root: Option<&str>) -> Result<Vec<&'static str>, String> {
     let skill_root = skill_root.unwrap_or(root);
     let absolute = skill_root != root || sys.is_home_dir(root);
@@ -632,12 +668,17 @@ pub fn repair_stale_hook_manifests(sys: &Sys, root: &str, providers: &[&'static 
             }
             for rel in rels {
                 let path = jsp::join(&[root, spec.dest_provider, rel]);
-                if !manifest_has_stale_hook(&path) {
+                let cursor_gate = *provider == ".cursor" && manifest_has_retired_cursor_gate(&path);
+                if !cursor_gate && !manifest_has_stale_hook(&path) {
                     continue;
                 }
                 let Ok(text) = util::read_text(&path) else { continue };
                 let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
-                let rewritten = rewrite_hook_commands_for_skill_root(&parsed, provider, skill_root, absolute);
+                let rewritten = if cursor_gate {
+                    migrate_cursor_gate(&parsed, skill_root, absolute)
+                } else {
+                    rewrite_hook_commands_for_skill_root(&parsed, provider, skill_root, absolute)
+                };
                 if rewritten != parsed {
                     util::write_bytes(&path, format!("{}\n", util::json_pretty(&rewritten)).as_bytes())?;
                     changed = true;
@@ -652,7 +693,7 @@ pub fn repair_stale_hook_manifests(sys: &Sys, root: &str, providers: &[&'static 
 }
 
 /// JS: HOOK_EXPLAINER
-pub const HOOK_EXPLAINER: &str = "\nImpeccable can install a design hook for this project. In Claude/Codex it\nchecks UI files after edits; in Cursor it checks proposed writes before they\nland and can block writes with detector findings. It feeds results back to\nyour agent so design slop gets caught as you build. Change it later with\n/impeccable hooks on|off.\n";
+pub const HOOK_EXPLAINER: &str = "\nImpeccable can install a design hook for this project. It checks UI files\nafter your agent edits them and feeds the findings back to the agent, so\ndesign slop gets caught as you build. Change it later with\n/impeccable hooks on|off.\n";
 
 /// JS: impeccable-config.mjs#setHookConsent(root, value)
 pub fn set_hook_consent(root: &str, value: &str) -> Result<String, String> {

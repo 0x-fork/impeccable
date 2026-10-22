@@ -411,13 +411,13 @@ To turn it off, run `npx impeccable telemetry off` (stored in `~/.impeccable/con
 
 ## Design hook
 
-On Claude Code, GitHub Copilot, Codex, Cursor, and Grok Build, `npx impeccable install` and `npx impeccable update` install a provider-native hook manifest along with the skill payload. The hook runs the Impeccable design detector on direct UI file edits and surfaces findings back into the agent flow. Claude Code, GitHub Copilot, and Codex surface findings after the edit (and run a deeper pass on Stop where supported). Grok Build scans after the edit to warm Stop, then surfaces on Stop; PostToolUse stdout never reaches the model. Cursor blocks bad proposed writes before they land.
+On Claude Code, GitHub Copilot, Codex, Cursor, and Grok Build, `npx impeccable install` and `npx impeccable update` install a provider-native hook manifest along with the skill payload. The hook runs the Impeccable design detector on direct UI file edits and surfaces findings back into the agent flow. Claude Code, GitHub Copilot, Codex, and Cursor surface findings after the edit (and run a deeper pass on Stop where supported). Grok Build scans after the edit to warm Stop, then surfaces on Stop; PostToolUse stdout never reaches the model.
 
 Installed hook surfaces:
 
 - Claude Code: `.claude/settings.local.json` (gitignored, machine-local) runs `${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/impeccable hook`. A hook moved into the shared `settings.json` is honored in place.
 - GitHub Copilot: `.github/hooks/impeccable.json` (committed, shared by the Copilot CLI and the cloud agent) runs `.github/skills/impeccable/scripts/impeccable hook`. The Copilot CLI activates it once the file is on the repository's default branch and the folder is trusted.
-- Cursor: `.cursor/hooks.json` runs `.cursor/skills/impeccable/scripts/impeccable hook-before-edit`.
+- Cursor: `.cursor/hooks.json` runs `.cursor/skills/impeccable/scripts/impeccable hook` on `postToolUse` for file writes. Projects set up with the older `preToolUse` write gate keep working; `npx impeccable update` moves them to the post-edit hook.
 - Codex: `.codex/hooks.json` runs `.agents/skills/impeccable/scripts/impeccable hook`, with a `commandWindows` sibling that calls `impeccable.cmd` for cmd.exe.
 - Grok Build: `.grok/hooks/impeccable.json` runs `.grok/skills/impeccable/scripts/impeccable hook`. Requires `/hooks-trust` or `--trust`. Findings reach the model on Stop, not after each edit.
 

@@ -959,7 +959,9 @@ pub fn split_findings_by_tier(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Find
 /// JS: perEditTieringActive(config, harness) — Claude Code, Codex, and
 /// Grok Build dispatch our Stop hook; Cursor and GitHub Copilot have no
 /// deep pass wired, so deferring for them would silently drop the
-/// non-immediate rules entirely.
+/// non-immediate rules entirely. Cursor's `stop` hook can only answer with a
+/// `followup_message` that Cursor submits as a new user turn, which is not
+/// wired (#1061), so its post-edit hook keeps the full rule set.
 pub fn per_edit_tiering_active(config: &HookConfig, harness: &str) -> bool {
     if harness == "cursor" || harness == "github" {
         return false;

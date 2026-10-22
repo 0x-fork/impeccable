@@ -98,6 +98,29 @@ export default [
   { id: 'hook-harness-github-apply-patch', verb: 'hook', workspace: 'hook-project', stdin: { sessionId: 'g1', cwd: WS, toolName: 'apply_patch', toolArgs: '*** Begin Patch\n*** Update File: src/components/Card.module.css\n@@\n-x\n+y\n*** End Patch' }, files: CACHE_FILES },
   { id: 'hook-harness-codex-apply-patch', verb: 'hook', workspace: 'hook-project', stdin: { session_id: 'c1', cwd: WS, hook_event_name: 'PostToolUse', tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Update File: src/components/Card.module.css\n@@\n-x\n+y\n*** End Patch' } }, files: CACHE_FILES },
   { id: 'hook-harness-cursor-shaped', verb: 'hook', workspace: 'hook-project', stdin: { conversation_id: 'cv1', workspace_roots: [WS], tool_name: 'Write', tool_input: { path: 'src/components/Card.module.css' } }, files: CACHE_FILES },
+  // The envelope Cursor 3.21 sends on postToolUse for an agent file edit
+  // (cursor-agent-exec): every edit is `tool_name: "Write"` with
+  // `tool_input: { file_path, content }`; the reply is `additional_context`.
+  {
+    id: 'hook-harness-cursor-post-tool-use', verb: 'hook', workspace: 'hook-project', files: CACHE_FILES,
+    stdin: {
+      conversation_id: 'cv1', generation_id: 'g1', session_id: 'cv1', hook_event_name: 'postToolUse',
+      cursor_version: '3.21.18', workspace_roots: [WS], user_email: null, transcript_path: null, model: 'composer-2',
+      tool_name: 'Write', tool_input: { file_path: `${WS}/src/components/Card.module.css`, content: '' },
+      tool_output: '{}', duration: 12, tool_use_id: 't1',
+    },
+  },
+  // Two Impeccable hooks for one edit (a plugin's and the project's): the
+  // second invocation of the same tool call finds the claim and stays silent;
+  // the next tool call scans again.
+  {
+    id: 'hook-duplicate-event-scans-once', workspace: 'hook-project', files: CACHE_FILES,
+    steps: [
+      { verb: 'hook', stdin: claudeEdit('src/components/Card.module.css', { tool_use_id: 'toolu_dup' }), env: { IMPECCABLE_HOOK_HARNESS: 'claude' } },
+      { verb: 'hook', stdin: claudeEdit('src/components/Card.module.css', { tool_use_id: 'toolu_dup' }) },
+      { verb: 'hook', stdin: claudeEdit('src/components/Card.tsx', { tool_use_id: 'toolu_next' }) },
+    ],
+  },
   { id: 'hook-harness-forced-github', verb: 'hook', workspace: 'hook-project', stdin: claudeEdit('src/components/Card.module.css'), env: { IMPECCABLE_HOOK_HARNESS: 'github' }, files: CACHE_FILES },
   { id: 'hook-audit-log', verb: 'hook', workspace: 'hook-project', stdin: claudeEdit('src/components/Card.module.css'), env: { IMPECCABLE_HOOK_LOG: `${WS}/.impeccable/audit.ndjson` }, files: CACHE_FILES },
   {
@@ -274,6 +297,13 @@ export default [
   {
     id: 'hadmin-on-repairs-existing-manifest', verb: 'hook-admin', workspace: 'hook-project', files: CACHE_FILES,
     setup: (ws) => { fs.mkdirSync(`${ws}/.claude`, { recursive: true }); fs.writeFileSync(`${ws}/.claude/settings.local.json`, JSON.stringify({ permissions: { allow: ['Bash(ls)'] }, hooks: { PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'node old/skills/impeccable/scripts/hook.mjs' }] }, { matcher: 'Write', hooks: [{ type: 'command', command: 'echo other' }] }] } }, null, 2) + '\n'); },
+    args: ['on'],
+  },
+  // The retired Cursor before-edit gate moves to postToolUse; the foreign
+  // preToolUse entry and the other event stay.
+  {
+    id: 'hadmin-on-migrates-cursor-gate', verb: 'hook-admin', workspace: 'hook-project', files: CACHE_FILES,
+    setup: (ws) => { fs.mkdirSync(`${ws}/.cursor`, { recursive: true }); fs.writeFileSync(`${ws}/.cursor/hooks.json`, JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: './audit.sh', matcher: 'Shell' }, { command: '[ ! -f ".cursor/skills/impeccable/scripts/impeccable" ] || ".cursor/skills/impeccable/scripts/impeccable" hook-before-edit', timeout: 5 }], stop: [{ command: './notify.sh' }] } }, null, 2) + '\n'); },
     args: ['on'],
   },
   {

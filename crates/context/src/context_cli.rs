@@ -1220,4 +1220,34 @@ mod worktree_hook_tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn cursor_post_edit_and_unmigrated_gate_both_count_as_per_edit_coverage() {
+        let base = std::env::temp_dir().join(format!("impeccable-cursor-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tmp = base.to_string_lossy().into_owned();
+        let project = jsp::join(&[&tmp, "proj"]);
+        std::fs::create_dir_all(jsp::join(&[&project, ".git"])).unwrap();
+        let manifest = jsp::join(&[&project, ".cursor", "hooks.json"]);
+        std::fs::create_dir_all(jsp::dirname(&manifest)).unwrap();
+        let env = Env::from([
+            ("HOME".to_string(), tmp.clone()),
+            ("USERPROFILE".to_string(), tmp.clone()),
+            ("IMPECCABLE_PROVIDER_ID".to_string(), "cursor".to_string()),
+        ]);
+        let provider = crate::provider::detect(&env, &project);
+        assert_eq!(provider.id, "cursor");
+        let mode = || {
+            let ctx = load_context(&project, &TargetOptions::default(), &env);
+            automatic_hook_mode(&ctx, &project, &env, &provider)
+        };
+        assert_eq!(mode(), "none");
+        // Post-edit only: Cursor has no Stop deep pass wired (#1061).
+        std::fs::write(&manifest, r#"{"version":1,"hooks":{"postToolUse":[{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook","matcher":"^Write$","timeout":5}]}}"#).unwrap();
+        assert_eq!(mode(), "per-edit");
+        // The retired gate still runs until the manifest is migrated.
+        std::fs::write(&manifest, r#"{"version":1,"hooks":{"preToolUse":[{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit","timeout":5}]}}"#).unwrap();
+        assert_eq!(mode(), "per-edit");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

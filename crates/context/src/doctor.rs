@@ -152,6 +152,26 @@ fn apply_fixes(report: &Report) -> Fixes {
             applied.push(format!("Moved {} to {}.", rel(present, &report.project_root), rel(canonical, &report.project_root)));
             continue;
         }
+        if entry.id == "cursor-hook-pre-edit-gate" {
+            let Some(path) = entry.path.as_deref() else { continue };
+            let abs = if jsp::is_absolute(path) { path.to_string() } else { jsp::join(&[&report.project_root, path]) };
+            let migrated = std::fs::read_to_string(&abs)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| crate::hook_markers::migrate_cursor_gate_in_place(&v));
+            match migrated {
+                Some(next) => {
+                    let body = format!("{}\n", json_pretty(&next));
+                    if std::fs::write(&abs, body).is_ok() {
+                        applied.push(format!("Moved the design hook in {} from preToolUse to postToolUse.", rel(&abs, &report.project_root)));
+                    } else {
+                        skipped.push((entry.id.clone(), format!("could not write {}", rel(&abs, &report.project_root))));
+                    }
+                }
+                None => skipped.push((entry.id.clone(), "the gate entry is not in the launcher form; run `impeccable hooks on`".to_string())),
+            }
+            continue;
+        }
         if entry.id == "legacy-live-state" {
             skipped.push((entry.id.clone(), "delete by hand once no live session is running".to_string()));
             continue;
