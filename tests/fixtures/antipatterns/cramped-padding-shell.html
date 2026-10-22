@@ -57,6 +57,7 @@
     .shift-each p { position: relative; left: -24px; }
     .float-shell { float: left; width: 480px; }
     .pull-each p { margin-left: -24px; }
+    .shorthand-pull-each p { margin: 0 0 0 -24px; }
     .nudge-each p { margin-left: -1px; }
     .em-pull-each p { font-size: 32px; line-height: 40px; margin-left: -0.75em; }
     .pinned { position: relative; height: 160px; }
@@ -106,6 +107,14 @@
         <span class="case-label">each padded paragraph has margin-left: -24px, which cancels its padding on the left rule.</span>
         <div class="flag-shell-negative-margin card ruled padded pull-each" id="flag-shell-negative-margin">
           <div class="shell"><p>Copy a negative margin pulled onto the rule.</p><p>A second paragraph beside it.</p></div>
+        </div>
+      </div>
+
+      <h3>Paragraphs pulled by a margin shorthand</h3>
+      <div class="case">
+        <span class="case-label">each padded paragraph has margin: 0 0 0 -24px, the same pull written as a shorthand.</span>
+        <div class="flag-shell-shorthand-pull card ruled padded shorthand-pull-each" id="flag-shell-shorthand-pull">
+          <div class="shell"><p>Copy a shorthand margin pulled onto the rule.</p><p>A second paragraph beside it.</p></div>
         </div>
       </div>
 

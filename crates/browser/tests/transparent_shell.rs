@@ -49,7 +49,7 @@ fn the_shell_fixture_reports_exactly_its_flag_column() {
             "#flag-shell-loose-sibling",
             "#flag-shell-margins-escape",
             "#flag-shell-negative-margin",
-            "#flag-shell-offset-left", "#flag-shell-offset-top", "#flag-shell-paragraph-offset", "#flag-shell-transform"],
+            "#flag-shell-offset-left", "#flag-shell-offset-top", "#flag-shell-paragraph-offset", "#flag-shell-shorthand-pull", "#flag-shell-transform"],
         "{findings:#?}"
     );
 }
