@@ -191,12 +191,28 @@ fn install_from_an_older_bundle_never_runs_the_post_edit_verb_before_the_edit() 
 }
 
 #[test]
-fn github_manifests_pass_through_and_grok_is_rewritten() {
-    // .github stays untouched: its committed manifest carries a portable
-    // `$(git rev-parse ...)` command that must never become machine-local.
+fn github_project_manifest_stays_portable_and_global_install_uses_home() {
+    // Project installs keep the committed `$(git rev-parse ...)` form.
     let bundle = json!({ "version": 1, "hooks": { "postToolUse": [{ "type": "command", "bash": "[ ! -f \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" ] || \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" hook" }] } });
-    assert_eq!(rewrite_hook_commands_for_platform(&bundle, ".github", "/proj", true, false), bundle);
+    assert_eq!(rewrite_hook_commands_for_platform(&bundle, ".github", "/proj", false, false), bundle);
+    // A global install still writes the manifest into the project, so its
+    // launcher must resolve from the user profile instead of the repository.
+    let global = rewrite_hook_commands_for_platform(&bundle, ".github", "/home/u", true, false);
+    assert_eq!(
+        global["hooks"]["postToolUse"][0]["bash"],
+        "[ ! -f \"$HOME/.github/skills/impeccable/scripts/impeccable\" ] || \"$HOME/.github/skills/impeccable/scripts/impeccable\" hook"
+    );
+    let windows = rewrite_hook_commands_for_platform(&bundle, ".github", r"C:\Users\u", true, true);
+    assert_eq!(
+        windows["hooks"]["postToolUse"][0]["bash"],
+        "[ ! -f 'C:/Users/u/.github/skills/impeccable/scripts/impeccable' ] || 'C:/Users/u/.github/skills/impeccable/scripts/impeccable' hook"
+    );
+    assert!(!windows["hooks"]["postToolUse"][0]["bash"].as_str().unwrap().contains("$HOME"));
     assert!(value_has_impeccable_hook_marker(&bundle));
+}
+
+#[test]
+fn grok_manifest_is_rewritten() {
     // .grok is rewritten like the other command-hook providers (upstream
     // 49571365, #642): a global install must not leave the bundled
     // project-relative path behind.

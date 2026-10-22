@@ -108,6 +108,19 @@ fn create_fake_universal_bundle(root: &str, providers: &[&str]) -> String {
     }
     if providers.contains(&".github") {
         write(
+            &format!("{bundle_root}/.github/hooks/impeccable.json"),
+            &json!({
+                "version": 1,
+                "hooks": { "postToolUse": [{
+                    "type": "command",
+                    "matcher": "edit|create|apply_patch",
+                    "bash": "[ ! -f \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" ] || \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" hook",
+                    "timeoutSec": 5
+                }] },
+            })
+            .to_string(),
+        );
+        write(
             &format!("{bundle_root}/.github/agents/impeccable-finish-reviewer.agent.md"),
             "---\nname: impeccable-finish-reviewer\ndescription: Reviews a finished build.\n---\nCopilot reviewer body.\n",
         );
@@ -692,6 +705,75 @@ fn global_install_rewrites_grok_project_hooks_to_the_global_skill_path() {
         !grok_hooks.contains("\\\".grok/skills/impeccable/scripts/hook.mjs\\\"") && !grok_hooks.contains("hook.mjs"),
         "grok hook still points at the project-relative bundle command: {grok_hooks}"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn global_install_rewrites_github_project_hook_to_the_global_skill_path() {
+    let root = temp_root("github-global");
+    let project = format!("{root}/project");
+    let home = format!("{root}/home");
+    let tmpdir = format!("{root}/tmp");
+    for dir in [&project, &home, &tmpdir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir_all(format!("{project}/.git")).unwrap();
+    let bundle_root = create_fake_universal_bundle(&project, &[".github"]);
+    let env = base_env(&home, &tmpdir, &bundle_root);
+
+    let r = run_cli(
+        &["install", "-y", "--providers=github", "--scope=global"],
+        &project,
+        &env,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    let manifest = read(&format!("{project}/.github/hooks/impeccable.json"));
+    let expected = if cfg!(windows) {
+        format!("{}/.github/skills/impeccable/scripts/impeccable", home.replace('\\', "/"))
+    } else {
+        "$HOME/.github/skills/impeccable/scripts/impeccable".to_string()
+    };
+    assert!(
+        manifest.contains(&expected),
+        "global GitHub hook did not name the user-scoped launcher: {manifest}"
+    );
+    assert!(
+        !manifest.contains("git rev-parse --show-toplevel"),
+        "global GitHub hook still names the project-scoped launcher: {manifest}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_global_github_hook_uses_userprofile_when_shell_home_differs() {
+    let root = temp_root("github-global-windows-home");
+    let project = format!("{root}/project");
+    let home = format!("{root}/profile-home");
+    let shell_home = format!("{root}/git-bash-home");
+    let tmpdir = format!("{root}/tmp");
+    for dir in [&project, &home, &shell_home, &tmpdir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir_all(format!("{project}/.git")).unwrap();
+    let bundle_root = create_fake_universal_bundle(&project, &[".github"]);
+    let mut env = base_env(&home, &tmpdir, &bundle_root);
+    env.insert("HOME".to_string(), shell_home.clone());
+
+    let r = run_cli(
+        &["install", "-y", "--providers=github", "--scope=global"],
+        &project,
+        &env,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    let manifest = read(&format!("{project}/.github/hooks/impeccable.json"));
+    let expected = format!(
+        "{}/.github/skills/impeccable/scripts/impeccable",
+        home.replace('\\', "/")
+    );
+    assert!(manifest.contains(&expected), "global GitHub hook did not name USERPROFILE: {manifest}");
+    assert!(!manifest.contains("$HOME"), "global GitHub hook still depends on Git Bash HOME: {manifest}");
+    assert!(!manifest.contains(&shell_home.replace('\\', "/")), "global GitHub hook names the wrong HOME: {manifest}");
     std::fs::remove_dir_all(&root).ok();
 }
 
