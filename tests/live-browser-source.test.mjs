@@ -1331,20 +1331,26 @@ function tuneHarness(params) {
   const body = node('div');
   const context = {
     state: 'CYCLING', paramsCurrentValues: {}, tuneOpen: false, currentSessionId: null,
+    visibleVariant: 1, restoredParamValues: null, rememberSessionFileMeta() {},
     paramsPanelBody: body, paramsPanelEl: node('div'), paramsPanelPalette: {},
     barEl: null, C: { brand: 'gold', ink: 'black' }, FONT: 'sans-serif', EASE: 'ease',
     document: { createElement: node }, el: (tag, style) => Object.assign(node(tag), { style }),
     getVisibleVariantEl: () => variant, parseVariantParams: () => params,
     applyParamValue: (target, p, value) => { target.values[p.id] = value; },
     showParamsPanel() {}, hideParamsPanel() {}, showOrUpdateCyclingBar() {}, queueCheckpoint() {},
+    saveSession() { context.savedParamValues = { ...context.paramsCurrentValues }; },
   };
-  const names = ['applyParamDefaults', 'formatRangeValue', 'buildParamsPanel', 'openTunePopover', 'closeTunePopover', 'refreshParamsPanel'];
+  const names = [
+    'applyParamDefaults', 'rememberSavedParamValues', 'restoredParamValuesForVisibleVariant', 'noteParamEdited',
+    'isValidSavedParamValue', 'applySavedParamValues', 'applySavedSessionMeta',
+    'formatRangeValue', 'buildParamsPanel', 'openTunePopover', 'closeTunePopover', 'refreshParamsPanel',
+  ];
   const functions = names.map(name => {
     const source = SOURCE.match(new RegExp(`function ${name}\\([^\\n]*\\) \\{[\\s\\S]*?\\n  \\}`))?.[0];
     assert.ok(source, name);
     return source;
   }).join('\n');
-  const api = runInNewContext(`${functions}\n({refreshParamsPanel, openTunePopover, closeTunePopover})`, context);
+  const api = runInNewContext(`${functions}\n({refreshParamsPanel, openTunePopover, closeTunePopover, applySavedSessionMeta, rememberSavedParamValues})`, context);
   const fire = (control, event) => control.listeners[event]({ stopPropagation() {} });
   return { api, context, variant, body, fire };
 }
@@ -1447,5 +1453,116 @@ describe('Tune first open without a refresh', () => {
     h.api.openTunePopover();
     assert.equal(h.context.paramsCurrentValues.italic, false, 'reopen keeps the edit');
     assert.equal(h.context.paramsCurrentValues.size, 0.4);
+  });
+});
+
+describe('Tune values across a reload', () => {
+  const PARAMS = [
+    { id: 'size', kind: 'range', min: 0, max: 1, default: 0.4 },
+    { id: 'italic', kind: 'toggle', default: false },
+    { id: 'face', kind: 'steps', default: 'sans', options: ['sans', { value: 'serif', label: 'Serif' }] },
+  ];
+  function resumed(saved) {
+    const h = tuneHarness(PARAMS);
+    h.context.currentSessionId = 's1';
+    h.context.visibleVariant = 2;
+    h.api.applySavedSessionMeta({ id: 's1', visible: 2, ...saved });
+    return h;
+  }
+
+  it('restores and applies the saved values for the resumed variant, through repeated refreshes', () => {
+    const h = resumed({ paramValues: { size: 0.8, italic: true, face: 'serif' } });
+    // The DOM resume refreshes from showVariantInDOM and again once cycling.
+    h.api.refreshParamsPanel();
+    h.api.refreshParamsPanel();
+    const expected = { size: 0.8, italic: true, face: 'serif' };
+    assert.deepEqual({ ...h.context.paramsCurrentValues }, expected);
+    assert.deepEqual({ ...h.variant.values }, expected);
+    h.api.openTunePopover();
+    assert.equal(h.body.children[0].children[1].value, '0.8', 'slider shows the restored value');
+    assert.equal(h.body.children[1].children[0].children[1].textContent, 'On');
+    assert.equal(h.body.children[2].children[0].children[1].textContent, 'Serif');
+  });
+
+  it('keeps the stash through refreshes outside cycling', () => {
+    const h = resumed({ paramValues: { size: 0.8 } });
+    h.context.state = 'GENERATING';
+    h.api.refreshParamsPanel();
+    h.context.state = 'CYCLING';
+    h.api.refreshParamsPanel();
+    assert.equal(h.context.paramsCurrentValues.size, 0.8);
+    assert.equal(h.variant.values.size, 0.8);
+  });
+
+  it('resets to defaults on a variant switch after the resume, and does not restore on switching back', () => {
+    const h = resumed({ paramValues: { size: 0.8, italic: true, face: 'serif' } });
+    h.api.refreshParamsPanel();
+    const nextVariant = { values: {} };
+    h.context.getVisibleVariantEl = () => nextVariant;
+    h.context.visibleVariant = 3;
+    h.api.refreshParamsPanel();
+    const defaults = { size: 0.4, italic: false, face: 'sans' };
+    assert.deepEqual({ ...h.context.paramsCurrentValues }, defaults);
+    assert.deepEqual({ ...nextVariant.values }, defaults);
+    assert.equal(h.context.restoredParamValues, null);
+    h.context.getVisibleVariantEl = () => h.variant;
+    h.context.visibleVariant = 2;
+    h.api.refreshParamsPanel();
+    assert.deepEqual({ ...h.context.paramsCurrentValues }, defaults);
+  });
+
+  it('drops the stash once a knob is edited, so a later refresh does not revive it', () => {
+    const h = resumed({ paramValues: { size: 0.8 } });
+    h.api.refreshParamsPanel();
+    h.api.openTunePopover();
+    h.fire(h.body.children[1].children[1], 'click');
+    assert.equal(h.context.restoredParamValues, null);
+    assert.equal(h.context.paramsCurrentValues.italic, true);
+  });
+
+  it('saves a knob edit locally, so the next reload restores it', () => {
+    const h = resumed({ paramValues: { size: 0.8 } });
+    h.api.refreshParamsPanel();
+    h.api.openTunePopover();
+    const input = h.body.children[0].children[1];
+    input.value = '0.2';
+    h.fire(input, 'input');
+    assert.deepEqual({ ...h.context.savedParamValues }, { size: 0.2, italic: false, face: 'sans' });
+    const reloaded = resumed({ paramValues: h.context.savedParamValues });
+    reloaded.api.refreshParamsPanel();
+    assert.equal(reloaded.context.paramsCurrentValues.size, 0.2);
+    assert.equal(reloaded.variant.values.size, 0.2);
+  });
+
+  it('ignores stale keys and values that no longer fit the param', () => {
+    const h = resumed({ paramValues: { gone: 5, size: 1.5, italic: 'on', face: 'mono' } });
+    h.api.refreshParamsPanel();
+    assert.deepEqual({ ...h.context.paramsCurrentValues }, { size: 0.4, italic: false, face: 'sans' });
+    assert.deepEqual({ ...h.variant.values }, { size: 0.4, italic: false, face: 'sans' });
+    for (const bad of [-0.1, Number.NaN, '0.5', null]) {
+      const r = resumed({ paramValues: { size: bad } });
+      r.api.refreshParamsPanel();
+      assert.equal(r.context.paramsCurrentValues.size, 0.4, `range value ${String(bad)} is ignored`);
+    }
+  });
+
+  it('ignores values saved for another session or another variant', () => {
+    const other = resumed({ id: 's0', paramValues: { size: 0.8 } });
+    other.api.refreshParamsPanel();
+    assert.equal(other.context.paramsCurrentValues.size, 0.4);
+    const elsewhere = resumed({ visible: 1, paramValues: { size: 0.8 } });
+    elsewhere.api.refreshParamsPanel();
+    assert.equal(elsewhere.context.paramsCurrentValues.size, 0.4);
+  });
+
+  it('reads the variant from both the local and the server session shapes', () => {
+    const h = tuneHarness(PARAMS);
+    h.api.rememberSavedParamValues({ id: 's1', visibleVariant: 2, paramValues: { size: 0.2 } });
+    assert.deepEqual({ ...h.context.restoredParamValues, values: { ...h.context.restoredParamValues.values } },
+      { sessionId: 's1', variant: 2, values: { size: 0.2 } });
+    h.api.rememberSavedParamValues({ id: 's1', visible: 3, paramValues: {} });
+    assert.equal(h.context.restoredParamValues.variant, 2, 'an empty save keeps the server values');
+    h.api.rememberSavedParamValues({ id: 's1', visible: 3, paramValues: { size: 0.3 } });
+    assert.equal(h.context.restoredParamValues.variant, 3);
   });
 });
