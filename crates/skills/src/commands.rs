@@ -621,9 +621,9 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
                 match bundle::download_and_extract_bundle(&sys) {
                     Ok(dir) => bundle_dir = Some(dir),
                     Err(e) => {
-                        if e.starts_with(crate::bundle_signature::ERROR_PREFIX)
+                        if e.is_remote()
                             || !missing_hook_targets.is_empty() || !missing_selected_targets.is_empty() {
-                            return Err(e);
+                            return Err(e.into());
                         }
                         update_check_skipped = true;
                         out(io, &format!("Could not check for skill updates: {e}"));
