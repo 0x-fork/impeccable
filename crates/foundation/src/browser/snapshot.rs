@@ -107,6 +107,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "content",
     "contentVisibility",
     "cssFloat",
+    "cursor",
     "direction",
     "display",
     "filter",

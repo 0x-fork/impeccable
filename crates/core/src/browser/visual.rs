@@ -2908,8 +2908,13 @@ fn candidate_value(dom: &dyn Dom, el: ElId, tag: &str, direct: &str, rect: &Rect
         Value::Bool(reasons.iter().any(|r| r == "background-clip text")),
     );
     // Text with no reading job reports as advisory from either visual
-    // pass; the key is only written when it holds.
-    if super::decorative_text::is_decorative_text_dom(dom, el) {
+    // pass, and so does text dimmed by a resting state the visitor changes
+    // (a stepper's inactive items, as in the element pass); the key is only
+    // written when it holds. The pixels already carry every fade, so the
+    // state walk does not stop at a surface.
+    if super::decorative_text::is_decorative_text_dom(dom, el)
+        || super::element_checks::dimmed_by_a_state(dom, el, None)
+    {
         m.insert("decorative".into(), Value::Bool(true));
     }
     // A halo that separates the glyphs from their ground may stay in the

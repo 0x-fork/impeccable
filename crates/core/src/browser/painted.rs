@@ -2838,7 +2838,7 @@ fn awaits_class_reveal(dom: &dyn Dom, el: ElId) -> bool {
 }
 
 /// The distinct class tokens of an element, as written.
-fn class_tokens(dom: &dyn Dom, el: ElId) -> Vec<String> {
+pub(crate) fn class_tokens(dom: &dyn Dom, el: ElId) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     for token in class_attr(dom, el).split_ascii_whitespace() {
         if !tokens.iter().any(|t| t == token) {
