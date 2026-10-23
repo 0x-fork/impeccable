@@ -52,6 +52,10 @@ const HEADING_MIN_COLUMN_CHARS: f64 = 20.0;
 /// and `pretty` move words between lines, and two words have nowhere to go.
 const MIN_WORDS: usize = 3;
 
+/// How far up from a block [`lines_run_past_a_clip`] looks for the box
+/// that clips its lines, as the tight-leading floor looks for a line clamp.
+const CLIP_SEARCH_DEPTH: usize = 4;
+
 /// The widths of the lines `el`'s text rendered on, top to bottom.
 ///
 /// `None` when the lines do not stack in one column. Lines come back sorted
@@ -65,6 +69,9 @@ fn line_widths(dom: &dyn Dom, el: ElId) -> Option<Vec<f64>> {
         .into_iter()
         .filter(|r| r.width > 0.0 && r.height > 0.0)
         .collect();
+    if lines_run_past_a_clip(dom, el, &rects) {
+        return None;
+    }
     let widest = rects.iter().copied().reduce(|a, b| if b.width > a.width { b } else { a });
     if let Some(w) = widest {
         if rects.iter().any(|r| r.right <= w.left || r.left >= w.right) {
@@ -129,6 +136,45 @@ fn push_rendered_text(dom: &dyn Dom, el: ElId, out: &mut String) {
             }
         }
     }
+}
+
+/// Whether `el`'s lines run past a box that clips them: a `-webkit-line-clamp`
+/// box (vercel.com's `p.line-clamp-2`, impeccable.style's release summaries)
+/// or one whose `overflow` clips on y, on `el` or within
+/// [`CLIP_SEARCH_DEPTH`] ancestors. Chromium lays out the lines a clamp
+/// hides below the box, and `Dom::text_line_rects` still returns them, so
+/// the last line measured is not the last line shown. A line whose middle
+/// lies below a clamp's content edge, or below an overflow clip's padding
+/// edge, is hidden. Clips that hide nothing
+/// leave the lines as they are.
+fn lines_run_past_a_clip(dom: &dyn Dom, el: ElId, lines: &[super::dom::Rect]) -> bool {
+    let Some(lowest) = lines.iter().map(|r| r.top + r.height / 2.0).reduce(f64::max) else {
+        return false;
+    };
+    let mut cur = Some(el);
+    for _ in 0..=CLIP_SEARCH_DEPTH {
+        let Some(c) = cur else { break };
+        let clamp = crate::checks::text_rules::is_line_clamp(&dom.style(c, "display"), &dom.style(c, "webkitLineClamp"));
+        let clips = |k: &str| matches!(dom.style(c, k).as_str(), "hidden" | "clip");
+        if clamp || clips("overflowY") || clips("overflow") {
+            let r = dom.rect(c);
+            let px = |k: &str| {
+                let v = js::parse_float(&dom.style(c, k));
+                if v.is_finite() { v } else { 0.0 }
+            };
+            // A clamp hides the lines past its count, so its content edge is
+            // the last line shown; overflow clips at the padding edge, and
+            // text set in the padding (a caption on a padding-hack ratio
+            // card) is in view.
+            let padding = if clamp { px("paddingBottom") } else { 0.0 };
+            let bottom = r.bottom - px("borderBottomWidth") - padding;
+            if bottom.is_finite() && lowest > bottom {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
 }
 
 /// Whether any of the text `el` sets on its lines does not paint: text in a
@@ -310,6 +356,35 @@ mod tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].id, "straggler");
         assert_eq!(hits[0].snippet, "\"text.\" alone on the last of 3 lines (7% of the measure)");
+    }
+
+    /// vercel.com's template cards: `-webkit-line-clamp: 2` on a paragraph
+    /// whose third line Chromium lays out below the box. The visitor reads
+    /// two lines ending in an ellipsis, not a lone last word. Twin: the same
+    /// paragraph unclamped, and a clamp that hides nothing, still report.
+    #[test]
+    fn lines_a_clamp_hides_are_not_judged() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let clamped = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_styles(clamped, &[("display", "-webkit-box"), ("webkitLineClamp", "2"), ("overflow", "hidden")]);
+        d.set_rect(clamped, 0.0, 100.0, 600.0, 48.0);
+        assert!(ids(&d, clamped).is_empty());
+        // In a clipping wrapper two levels up.
+        let card = d.add(Some(body), "div");
+        d.set_styles(card, &[("overflowY", "hidden"), ("paddingBottom", "0px"), ("borderBottomWidth", "0px")]);
+        d.set_rect(card, 0.0, 100.0, 600.0, 48.0);
+        let inner = d.add(Some(card), "div");
+        let wrapped = block(&mut d, inner, "p", PROSE, &[560.0, 560.0, 40.0]);
+        assert!(ids(&d, wrapped).is_empty());
+
+        let free = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_rect(free, 0.0, 100.0, 600.0, 72.0);
+        assert_eq!(ids(&d, free), vec!["straggler"]);
+        let roomy = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_styles(roomy, &[("display", "-webkit-box"), ("webkitLineClamp", "3"), ("overflow", "hidden")]);
+        d.set_rect(roomy, 0.0, 100.0, 600.0, 72.0);
+        assert_eq!(ids(&d, roomy), vec!["straggler"], "a clamp of three shows all three lines");
     }
 
     /// A soft hyphen paints nothing, so the snippet names the word a reader

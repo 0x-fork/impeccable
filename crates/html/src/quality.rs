@@ -17,7 +17,7 @@ use impeccable_core::checks::text_context::FinePrint;
 use impeccable_core::checks::text_rules::{
     font_weight_number, is_bold_title_leading, is_cjk_text, is_line_clamp,
     is_under_ui_text_floor, justifies_without_word_spaces_text, tracking_is_crushed,
-    ALL_CAPS_LONG_RUN, JUSTIFY_NARROW_CHARS_PER_LINE, LEADING_DISPLAY_TYPE_PX,
+    ALL_CAPS_LONG_RUN, JUSTIFY_NARROW_CHARS_PER_LINE, LEADING_CAPS_LABEL_MIN_RATIO, LEADING_DISPLAY_TYPE_PX,
     LEADING_HEADING_CONTEXT, NON_RENDERED_TAGS, QUALITY_TEXT_TAGS, SMALLPRINT_TEXT_FLOOR_PX,
     SR_ONLY_SELECTOR, UI_TEXT_FLOOR_PX,
 };
@@ -925,8 +925,18 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                 let family = sv(style, "fontFamily");
                 let is_code_run = el.closest("pre").is_some()
                     && (family.is_empty() || impeccable_core::checks::text_rules::is_monospace_family(family));
+                // Capitals have no descenders to crowd the line below
+                // (r13-t3), as the browser engine reads them. With no layout
+                // the lead-text exemption, which counts lines, is browser-only.
+                // A label is set solid or looser, and here, with no lines to
+                // count (the browser bounds it to three), shorter than a
+                // sentence: the nearest stand-in without layout.
+                let caps = sv(style, "textTransform") == "uppercase"
+                    && shown >= LEADING_CAPS_LABEL_MIN_RATIO
+                    && utf16_len(&collapse_ws(js::trim(&el.text_content()))) < ALL_CAPS_LONG_RUN;
                 if ratio > 0.0
                     && shown < 1.3
+                    && !caps
                     && !is_code_run
                     && !is_non_rendered_text(el, tag, Some(style))
                     && !is_visually_hidden(el, style)

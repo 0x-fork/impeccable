@@ -1550,7 +1550,8 @@ fn capped_script_errors<'a>(errors: impl IntoIterator<Item = (&'a str, Option<&'
 /// decision r3-31-script-error-ad-tech). One of React's recoverable
 /// hydration errors reports as advisory with its text unchanged: React
 /// renders the page again on the client and the page shows complete (corpus
-/// decision r5-p13-script-error-hydration).
+/// decision r5-p13-script-error-hydration). So does a `play()` a later
+/// `pause()` interrupted: the video does what the last call asked.
 fn script_error_result(message: &str, source: Option<&str>) -> RawResult {
     let snippet = match source {
         Some(source) => format!("{message} ({source})"),
@@ -1566,10 +1567,14 @@ fn script_error_result(message: &str, source: Option<&str>) -> RawResult {
                 impeccable_core::third_party::tag_detail(&snippet, vendor),
             )
         },
-        None if impeccable_core::script_errors::react_recoverable_hydration_error(message).is_some() => RawResult {
-            severity: "advisory".to_string(),
-            ..RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet)
-        },
+        None if impeccable_core::script_errors::react_recoverable_hydration_error(message).is_some()
+            || impeccable_core::script_errors::media_play_interrupted(message) =>
+        {
+            RawResult {
+                severity: "advisory".to_string(),
+                ..RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet)
+            }
+        }
         None => RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet),
     }
 }

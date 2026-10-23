@@ -1899,6 +1899,179 @@ pub(crate) fn gradient_text_paints_a_ramp(dom: &dyn Dom, el: ElId) -> bool {
     !crate::checks::rules::gradient_stops_are_one_colour(&image)
 }
 
+/// Whether two colours are one, within [`RAMP_MIN_CHANNEL_DELTA`] on every
+/// channel, alpha included.
+fn same_colour(a: &Rgba, b: &Rgba) -> bool {
+    (a.r - b.r).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.g - b.g).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.b - b.b).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.alpha_or_one() - b.alpha_or_one()).abs() * 255.0 < RAMP_MIN_CHANNEL_DELTA
+}
+
+/// Whether the gradient clipped to `el`'s text is a loading shimmer: its
+/// first and last stops are the text's own colour, the layer is wider than
+/// the box (`background-size` over 100% on x), and an animation that runs
+/// forever moves its `background-position`. cursor.com's "Working" labels
+/// (`linear-gradient(90deg, ink 0%, ink 30%, highlight 55%, ink 70%, ink
+/// 100%)` at `200% 100%`, `shimmer` sweeping `background-position-x`): a
+/// highlight passing over plain type, a state of the label rather than a
+/// gradient treatment. The ink has to hold solid over at least half the
+/// layer ([`ink_plateau_share`]): a rainbow headline that sets `color` to
+/// its end stop as a fallback (`#ff0080, #7928ca, #2563eb, #ff0080`) meets
+/// its ink only at the two ends, and stays gradient text. Any part the
+/// capture did not record keeps the finding.
+pub(crate) fn gradient_text_is_a_shimmer(dom: &dyn Dom, el: ElId) -> bool {
+    let image = dom.style(el, "backgroundImage");
+    let stops = parse_gradient_colors(Some(&image));
+    let (Some(first), Some(last), Some(ink)) = (stops.first(), stops.last(), parse_any_color(Some(&dom.style(el, "color"))))
+    else {
+        return false;
+    };
+    if stops.len() < 3 || !same_colour(first, &ink) || !same_colour(last, &ink) {
+        return false;
+    }
+    if !ink_plateau_share(&image, &ink).is_some_and(|share| share >= SHIMMER_INK_MIN_SHARE) {
+        return false;
+    }
+    let size = dom.style(el, "backgroundSize");
+    let width = size.split_whitespace().next().unwrap_or("");
+    let wider = width
+        .strip_suffix('%')
+        .map(parse_float)
+        .is_some_and(|w| w.is_finite() && w > 100.0);
+    if !wider {
+        return false;
+    }
+    let names = dom.style(el, "animationName");
+    let counts = dom.style(el, "animationIterationCount");
+    let counts: Vec<&str> = counts.split(',').map(str::trim).collect();
+    // A paused sweep (a reduced-motion rule, a pause control) leaves the
+    // gradient standing still: that is gradient text.
+    let states = dom.style(el, "animationPlayState");
+    let states: Vec<&str> = states.split(',').map(str::trim).collect();
+    names.split(',').map(str::trim).enumerate().any(|(i, name)| {
+        let count = counts.get(i % counts.len().max(1)).copied().unwrap_or("");
+        let state = states.get(i % states.len().max(1)).copied().unwrap_or("");
+        name != "none"
+            && count == "infinite"
+            && state != "paused"
+            && dom.keyframes(name).is_some_and(|frames| {
+                frames
+                    .iter()
+                    .any(|f| f.decls.iter().any(|(p, _)| p.starts_with("background-position")))
+            })
+    })
+}
+
+/// The least share of a shimmer's layer its ink holds solid
+/// ([`gradient_text_is_a_shimmer`]): cursor.com's holds 60%, the ink from 0
+/// to 30% and from 70 to 100%.
+const SHIMMER_INK_MIN_SHARE: f64 = 0.5;
+
+/// The share of a single `linear-gradient`'s length over which it holds
+/// `ink` solid: the runs between two neighbouring stops that are both
+/// `ink`, and the ends past a first or last stop that is. Stops without a
+/// position are spread as CSS spreads them. `None` for anything else
+/// (several layers, a stop at `px` or `calc()`, a colour that does not
+/// parse).
+fn ink_plateau_share(image: &str, ink: &Rgba) -> Option<f64> {
+    let args = js::trim(image).strip_prefix("linear-gradient(")?.strip_suffix(')')?;
+    if args.contains("gradient(") || args.contains("url(") {
+        return None;
+    }
+    let mut parts = crate::color::split_top_level_commas(args);
+    let head = js::to_lower_case(js::trim(parts.first()?));
+    if head.starts_with("to ") || ["deg", "turn", "rad", "grad"].iter().any(|u| head.ends_with(u)) {
+        parts.remove(0);
+    }
+    let mut stops: Vec<(bool, Option<f64>)> = Vec::new();
+    for part in &parts {
+        let part = js::trim(part);
+        let (color, rest) = match part.find(')') {
+            Some(i) if part[..i].contains('(') => (&part[..=i], &part[i + 1..]),
+            _ => match part.find(char::is_whitespace) {
+                Some(i) => (&part[..i], &part[i..]),
+                None => (part, ""),
+            },
+        };
+        let is_ink = same_colour(&parse_any_color(Some(color))?, ink);
+        let positions = rest
+            .split_whitespace()
+            .map(|p| p.strip_suffix('%').map(parse_float).filter(|v| v.is_finite()))
+            .collect::<Option<Vec<f64>>>()?;
+        match positions.as_slice() {
+            [] => stops.push((is_ink, None)),
+            [a] => stops.push((is_ink, Some(*a))),
+            [a, b] => {
+                stops.push((is_ink, Some(*a)));
+                stops.push((is_ink, Some(*b)));
+            }
+            _ => return None,
+        }
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    // Positions as CSS resolves them: the ends default to 0 and 100, a
+    // position under an earlier one is raised to it, and a run without
+    // positions is spread evenly between its neighbours.
+    let n = stops.len();
+    let mut at: Vec<Option<f64>> = stops.iter().map(|s| s.1).collect();
+    at[0] = Some(at[0].unwrap_or(0.0));
+    at[n - 1] = Some(at[n - 1].unwrap_or(100.0));
+    let mut max = 0.0f64;
+    for a in at.iter_mut().flatten() {
+        max = max.max(*a);
+        *a = max;
+    }
+    let mut i = 0;
+    while i < n {
+        if at[i].is_none() {
+            let start = i - 1;
+            let end = (i..n).find(|&j| at[j].is_some())?;
+            let (from, to) = (at[start]?, at[end]?);
+            for (k, slot) in at.iter_mut().enumerate().take(end).skip(i) {
+                *slot = Some(from + (to - from) * (k - start) as f64 / (end - start) as f64);
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    let at: Vec<f64> = at.into_iter().collect::<Option<Vec<f64>>>()?;
+    let mut solid = 0.0;
+    if stops[0].0 {
+        solid += at[0].clamp(0.0, 100.0);
+    }
+    if stops[n - 1].0 {
+        solid += (100.0 - at[n - 1]).clamp(0.0, 100.0);
+    }
+    for k in 0..n - 1 {
+        if stops[k].0 && stops[k + 1].0 {
+            solid += (at[k + 1].min(100.0) - at[k].max(0.0)).max(0.0);
+        }
+    }
+    Some(solid / 100.0)
+}
+
+/// Whether every stop of the gradient clipped to `el`'s text is one RGB at
+/// different alphas (resend.com's `#fff` to `rgba(255, 255, 255, .5)`): a
+/// sheen of one colour fading, not a ramp between colours. It still steps
+/// on a dark ground, so it reports, as advisory (taste call r13-t6).
+pub(crate) fn gradient_text_varies_only_in_alpha(dom: &dyn Dom, el: ElId) -> bool {
+    let image = dom.style(el, "backgroundImage");
+    if !crate::checks::rules::gradient_stops_all_readable(&image) {
+        return false;
+    }
+    let stops = parse_gradient_colors(Some(&image));
+    let Some(first) = stops.first() else { return false };
+    stops.len() >= 2
+        && stops.iter().all(|c| {
+            (c.r - first.r).abs() < RAMP_MIN_CHANNEL_DELTA
+                && (c.g - first.g).abs() < RAMP_MIN_CHANNEL_DELTA
+                && (c.b - first.b).abs() < RAMP_MIN_CHANNEL_DELTA
+        })
+}
+
 /// The smallest type [`box_holds_a_text_line`] reads as a line of text.
 const SHORT_LINE_MIN_FONT_PX: f64 = 8.0;
 
@@ -2462,8 +2635,14 @@ pub fn check_element_colors_dom_in(
             }
         }
     }
-    if findings.iter().any(|h| h.id == "gradient-text") && !gradient_text_paints_a_ramp(dom, el) {
-        findings.retain(|h| h.id != "gradient-text");
+    if findings.iter().any(|h| h.id == "gradient-text") {
+        if !gradient_text_paints_a_ramp(dom, el) || gradient_text_is_a_shimmer(dom, el) {
+            findings.retain(|h| h.id != "gradient-text");
+        } else if gradient_text_varies_only_in_alpha(dom, el) {
+            for h in findings.iter_mut().filter(|h| h.id == "gradient-text") {
+                h.severity = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+            }
+        }
     }
     if tag == "input" || tag == "textarea" {
         let placeholder = dom.attr(el, "placeholder").unwrap_or_default();
@@ -5543,6 +5722,23 @@ pub fn check_element_blinking_cursor_dom(dom: &dyn Dom, el: ElId) -> Vec<Browser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cursor.com's shimmer holds its ink over 60% of the layer; a rainbow
+    /// that ends on its fallback colour meets the ink only at its ends; a
+    /// stop the engine cannot place gives no answer.
+    #[test]
+    fn ink_plateau_share_reads_the_solid_runs() {
+        let ink = parse_any_color(Some("rgba(0, 0, 0, 0.38)")).unwrap();
+        let cursor = "linear-gradient(90deg, rgba(0, 0, 0, 0.38) 0%, rgba(0, 0, 0, 0.38) 30%, color(srgb 0.14 0.137 0.111 / 0.913) 55%, rgba(0, 0, 0, 0.38) 70%, rgba(0, 0, 0, 0.38) 100%)";
+        assert!((ink_plateau_share(cursor, &ink).unwrap() - 0.6).abs() < 1e-9);
+        let pink = parse_any_color(Some("rgb(255, 0, 128)")).unwrap();
+        let rainbow = "linear-gradient(90deg, rgb(255, 0, 128), rgb(121, 40, 202), rgb(37, 99, 235), rgb(255, 0, 128))";
+        assert_eq!(ink_plateau_share(rainbow, &pink), Some(0.0));
+        let hard = "linear-gradient(90deg, rgb(255, 0, 128) 40%, rgb(37, 99, 235) 40% 60%, rgb(255, 0, 128) 60%)";
+        assert!((ink_plateau_share(hard, &pink).unwrap() - 0.8).abs() < 1e-9);
+        let px = "linear-gradient(90deg, rgb(255, 0, 128) 10px, rgb(37, 99, 235))";
+        assert_eq!(ink_plateau_share(px, &pink), None);
+    }
     use crate::browser::fake_dom::FakeDom;
 
     /// One element, its own page-level dedupe state.
@@ -5566,6 +5762,68 @@ mod tests {
             );
         }
         (d, body)
+    }
+
+    /// cursor.com's "Working" label: a highlight sweeping over plain type
+    /// is a loading state, not gradient text (row 12). Twins: the same
+    /// shimmer at rest (no infinite animation), and a pink-to-violet ramp.
+    /// resend.com's one-colour sheen reports as advisory (r13-t6).
+    #[test]
+    fn gradient_text_reads_a_shimmer_and_a_one_colour_sheen() {
+        let (mut d, body) = page();
+        d.keyframes.insert(
+            "shimmer".to_string(),
+            vec![crate::browser::dom::KeyframeFrame {
+                decls: vec![("background-position-x".to_string(), "200%".to_string())],
+            }],
+        );
+        let label = |d: &mut FakeDom, ink: &str, gradient: &str, size: &str, count: &str, y: f64| {
+            let s = d.add(Some(body), "span");
+            visible(d, s);
+            d.add_text(s, "Working on it");
+            d.set_styles(
+                s,
+                &[
+                    ("color", ink),
+                    ("backgroundImage", gradient),
+                    ("backgroundClip", "text"),
+                    ("webkitBackgroundClip", "text"),
+                    ("backgroundSize", size),
+                    ("animationName", "shimmer"),
+                    ("animationIterationCount", count),
+                    ("fontSize", "16px"),
+                    ("fontWeight", "400"),
+                ],
+            );
+            d.set_rect(s, 12.0, y, 162.0, 24.0);
+            d.set_text_rect(s, 12.0, y, 120.0, 24.0);
+            s
+        };
+        let gradient = |hits: Vec<RuleHit>| hits.into_iter().filter(|h| h.id == "gradient-text").collect::<Vec<_>>();
+        let shimmer_bg = "linear-gradient(90deg, rgba(0, 0, 0, 0.38) 0%, rgba(0, 0, 0, 0.38) 30%, rgba(36, 35, 28, 0.91) 55%, rgba(0, 0, 0, 0.38) 70%, rgba(0, 0, 0, 0.38) 100%)";
+        let shimmer = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "200% 100%", "infinite", 40.0);
+        assert!(gradient(colors(&d, shimmer)).is_empty(), "a running shimmer");
+        let once = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "200% 100%", "1", 80.0);
+        assert_eq!(gradient(colors(&d, once)).len(), 1, "a sweep that ends is not a running state");
+        let fitted = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "100% 100%", "infinite", 120.0);
+        assert_eq!(gradient(colors(&d, fitted)).len(), 1, "a layer the size of the box shows its whole ramp");
+        let ramp = label(&mut d, "rgba(0, 0, 0, 0)", "linear-gradient(90deg, #db2777, #7c3aed)", "200% 100%", "infinite", 160.0);
+        let hits = gradient(colors(&d, ramp));
+        assert_eq!(hits.len(), 1, "a pink-to-violet ramp");
+        assert_eq!(hits[0].severity, None);
+
+        let sheen = label(
+            &mut d,
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right bottom, rgb(255, 255, 255) 30%, rgba(255, 255, 255, 0.5))",
+            "auto",
+            "1",
+            200.0,
+        );
+        d.set_style(sheen, "animationName", "none");
+        let hits = gradient(colors(&d, sheen));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].severity.as_deref(), Some(crate::checks::rules::ADVISORY_SEVERITY));
     }
 
     /// interplanetaryfund.base44.app's tagline on a solid ground: a pale
@@ -11044,6 +11302,38 @@ mod tests {
         }));
         assert!(run(&|d, button, _, _| { d.set_style(button, "transform", "matrix(1, 0, 0.3, 1, 0, 0)"); }));
         assert!(!run(&|d, _, cover, _| { d.set_style(cover, "transform", "matrix(1, 0, 0, 1, 0, 4)"); }));
+    }
+
+    /// apple.com's stacked gallery below the fold: five tab panels in one
+    /// grid cell, the active one at `z-index: 2` with a white fill, the
+    /// others at 0. A caption in a hidden panel is covered by the active
+    /// one, earlier in the tree. Twins: the caption in the active panel, a
+    /// panel ranked equal, and a higher card that covers part of the
+    /// caption keep their verdicts.
+    #[test]
+    fn a_sibling_ranked_above_the_text_covers_it_below_the_fold() {
+        let run = |active_z: &str, cover_h: f64, in_active: bool| {
+            let (mut d, body) = page();
+            let top = 13311.0;
+            let gallery = bare_box(&mut d, body, "div", (150.0, top, 980.0, 795.0));
+            d.set_styles(gallery, &[("display", "grid"), ("position", "relative")]);
+            let active = bare_box(&mut d, gallery, "div", (150.0, top, 980.0, cover_h));
+            d.set_styles(
+                active,
+                &[("zIndex", active_z), ("opacity", "1"), ("backgroundColor", "rgb(255, 255, 255)"), ("position", "static")],
+            );
+            let hidden = bare_box(&mut d, gallery, "div", (150.0, top, 980.0, 795.0));
+            d.set_styles(hidden, &[("zIndex", "0"), ("opacity", "1"), ("position", "static")]);
+            d.set_attr(hidden, "aria-hidden", "true");
+            let parent = if in_active { active } else { hidden };
+            let caption = faint_copy(&mut d, parent, "rgb(134, 134, 139)", (972.0, top + 596.0, 158.0, 14.0));
+            d.set_styles(caption, &[("zIndex", "auto"), ("position", "static")]);
+            reports_contrast(&colors(&d, caption))
+        };
+        assert!(!run("2", 795.0, false), "a caption under the active panel");
+        assert!(run("2", 795.0, true), "the active panel's own caption");
+        assert!(run("0", 795.0, false), "panels ranked equal fall to document order");
+        assert!(run("2", 600.0, false), "a panel that covers part of the caption");
     }
 
     /// A transparent grain overlay laid over a section below the fold: the

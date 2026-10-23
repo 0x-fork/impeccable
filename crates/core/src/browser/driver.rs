@@ -1608,6 +1608,7 @@ fn computes_clipped_gradient(dom: &dyn Dom, el: ElId) -> bool {
 fn clipped_gradient_silent(dom: &dyn Dom, el: ElId) -> bool {
     super::painted::unpainted_for(dom, el, super::painted::PaintGate::Text).is_some()
         || !super::element_checks::gradient_text_paints_a_ramp(dom, el)
+        || super::element_checks::gradient_text_is_a_shimmer(dom, el)
 }
 
 /// Whether the declaration a stylesheet gradient-text form names is silent:

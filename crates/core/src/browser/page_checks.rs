@@ -2155,6 +2155,41 @@ fn rhythm_one_line(dom: &dyn Dom, el: ElId) -> bool {
     }
 }
 
+/// The fewest characters of running text that make an inline heading a
+/// run-in one. A badge or tag set after a heading ("Billing changes
+/// [New]") is shorter: that heading still sits alone on its line.
+const RUN_IN_TEXT_MIN_CHARS: usize = 20;
+
+/// Whether `h` is a run-in heading: computed `display: inline`, and the
+/// next thing after it is running text on its last line. That is a text
+/// node, or an inline-level sibling whose box starts above the heading's
+/// bottom, holding at least [`RUN_IN_TEXT_MIN_CHARS`] characters.
+fn heading_runs_in(dom: &dyn Dom, h: ElId) -> bool {
+    if dom.style(h, "display") != "inline" {
+        return false;
+    }
+    let Some(parent) = dom.parent(h) else { return false };
+    let chars = |t: &str| collapse_ws(js::trim(t)).chars().count();
+    let mut after = dom
+        .child_nodes(parent)
+        .into_iter()
+        .skip_while(|c| !matches!(c, super::dom::DomChild::Element(e) if *e == h))
+        .skip(1);
+    let next = after.find(|c| match c {
+        super::dom::DomChild::Text(t) => !t.trim().is_empty(),
+        super::dom::DomChild::Element(e) => dom.style(*e, "display") != "none",
+    });
+    match next {
+        Some(super::dom::DomChild::Text(t)) => chars(&t) >= RUN_IN_TEXT_MIN_CHARS,
+        Some(super::dom::DomChild::Element(e)) => {
+            dom.style(e, "display").starts_with("inline")
+                && dom.rect(e).top < dom.rect(h).bottom
+                && chars(&dom.text_content(e)) >= RUN_IN_TEXT_MIN_CHARS
+        }
+        None => false,
+    }
+}
+
 pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     const MIN_VIOLATIONS: usize = 2;
     const CARD_EXEMPT_HEIGHT: f64 = 200.0;
@@ -2416,6 +2451,12 @@ pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         // section heading (tau.ac.il's `blockquote > h2`, 120 characters
         // on three lines): it heads nothing, and counts toward no minimum.
         if closest_or_none(dom, h, "blockquote, q").is_some() {
+            continue;
+        }
+        // A run-in heading (stripe.com's `h2` computed `display: inline`
+        // beside an inline `p`) starts a line of the paragraph it leads:
+        // "below" would measure to the next block, not to its own text.
+        if heading_runs_in(dom, h) {
             continue;
         }
         // A heading nobody sees at rest (a slide parked past its track, a
@@ -5873,6 +5914,51 @@ mod tests {
             f[0].finding.detail,
             "h2 \"Heading number 0\" has 8px above vs 40px below — it reads as bound to the block above (2 headings on page)"
         );
+    }
+
+    /// stripe.com's run-in headings: an `h2` computed `display: inline`
+    /// leading an inline `p` on its line. Its "below" would measure to the
+    /// next block. Twins: the same layout with block headings, and an inline
+    /// heading followed only by a short badge ("Billing changes [New]"),
+    /// which still sits alone on its line, keep both findings.
+    #[test]
+    fn heading_rhythm_skips_run_in_headings() {
+        let build = |kind: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let sec = d.add(Some(body), "section");
+            d.set_styles(sec, FLOW);
+            d.set_rect(sec, 0.0, 0.0, 800.0, 1000.0);
+            let mut y = 0.0;
+            for i in 0..2 {
+                let p0 = flow(&mut d, sec, "p", (0.0, y, 800.0, 20.0), "Intro paragraph text that runs well past forty characters");
+                d.set_style(p0, "fontSize", "20px");
+                y += 28.0;
+                let row = flow(&mut d, sec, "div", (0.0, y, 800.0, 30.0), "");
+                let h = flow(&mut d, row, "h2", (0.0, y, 300.0, 30.0), &format!("Heading number {i}"));
+                if kind != "block" {
+                    d.set_style(h, "display", "inline");
+                }
+                match kind {
+                    "run-in" => {
+                        let lead = flow(&mut d, row, "p", (300.0, y, 500.0, 30.0), "Invoices now show tax lines for every region.");
+                        d.set_style(lead, "display", "inline");
+                    }
+                    "badge" => {
+                        let badge = flow(&mut d, row, "span", (308.0, y + 6.0, 40.0, 18.0), "New");
+                        d.set_style(badge, "display", "inline-block");
+                    }
+                    _ => {}
+                }
+                y += 70.0;
+                flow(&mut d, sec, "p", (0.0, y, 800.0, 20.0), "Body paragraph");
+                y += 60.0;
+            }
+            check_heading_rhythm_dom(&d).len()
+        };
+        assert_eq!(build("block"), 2);
+        assert_eq!(build("badge"), 2, "a heading beside a badge sits alone on its line");
+        assert_eq!(build("run-in"), 0);
     }
 
     const FLOW: &[(&str, &str)] = &[
