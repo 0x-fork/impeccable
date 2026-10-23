@@ -13,6 +13,7 @@ use impeccable_core::checks::measures::{
     resolve_length_px, TRACKED_LABEL_MAX_CHARS,
 };
 use impeccable_core::checks::rules::RuleHit;
+use impeccable_core::checks::text_context::FinePrint;
 use impeccable_core::checks::text_rules::{
     font_weight_number, is_bold_title_leading, is_cjk_text, is_line_clamp,
     is_under_ui_text_floor, justifies_without_word_spaces_text, tracking_is_crushed,
@@ -1004,11 +1005,15 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
             && !is_non_rendered_text(el, tag, Some(style))
         {
             // Fine print (taste call r5-p27) and text in a mockup (r5-p26)
-            // report as advisory.
-            findings.push(advisory_if(
-                RuleHit::new("tiny-text", format!("{}px body text", number_to_string(font_size))),
-                crate::text_context::is_fine_print(el) || crate::text_context::in_mock_context(el),
-            ));
+            // report as advisory; a legal or footnote block reports nothing
+            // (decision 3, round 13).
+            let fine_print = crate::text_context::fine_print(el);
+            if fine_print != FinePrint::Exempt {
+                findings.push(advisory_if(
+                    RuleHit::new("tiny-text", format!("{}px body text", number_to_string(font_size))),
+                    fine_print == FinePrint::Advisory || crate::text_context::in_mock_context(el),
+                ));
+            }
         }
     }
 

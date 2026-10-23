@@ -16,6 +16,7 @@ use crate::checks::measures::{
     resolve_length_px, text_wraps_to_multiple_lines, TRACKED_LABEL_MAX_CHARS,
 };
 use crate::checks::rules::RuleHit;
+use crate::checks::text_context::FinePrint;
 use super::text_geometry::{
     holds_only_phrasing, line_pitch_px, phrasing_holds_break, phrasing_text_extent, phrasing_text_font,
     clamp_to_own_clip, rides_a_running_track, scrolling_ancestor_cuts, text_line_count,
@@ -1870,12 +1871,18 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
     // (`crate::checks::text_context`), each asked once and only of an
     // element that failed: legal fine print under line-length, tiny-text and
     // tight-leading (taste call r5-p27), and mock context under tiny-text
-    // and undersized-ui-text (r5-p26).
+    // and undersized-ui-text (r5-p26). A legal or footnote block is exempt
+    // from line-length and tiny-text (decision 3, round 13):
+    // `fine_print_hit` drops the finding there, and tight-leading, which
+    // stays advisory, asks `fine_print_advisory`.
     let fine_print = std::cell::OnceCell::new();
-    let fine_print_hit = |hit: RuleHit| {
-        let yes = *fine_print.get_or_init(|| super::text_context::is_fine_print_dom(dom, el));
-        advisory_if(hit, yes)
+    let fine_print_tier = || *fine_print.get_or_init(|| super::text_context::fine_print_dom(dom, el));
+    let is_fine_print = || fine_print_tier() != FinePrint::No;
+    let fine_print_hit = |hit: RuleHit| match fine_print_tier() {
+        FinePrint::Exempt => None,
+        tier => Some(advisory_if(hit, tier == FinePrint::Advisory)),
     };
+    let fine_print_advisory = |hit: RuleHit| advisory_if(hit, is_fine_print());
     let mock = std::cell::OnceCell::new();
     let in_mock = || *mock.get_or_init(|| super::text_context::in_mock_context_dom(dom, el));
 
@@ -1964,7 +1971,7 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 let long = widths.iter().filter(|w| chars(**w) > over).count();
                 if long >= 2 {
                     let longest = widths.iter().copied().fold(0.0, js::math_max);
-                    findings.push(fine_print_hit(RuleHit::new(
+                    findings.extend(fine_print_hit(RuleHit::new(
                         "line-length",
                         format!(
                             "~{} chars on {} of {} rendered lines (aim for <{})",
@@ -2496,7 +2503,7 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     && !is_heading_text(dom, el)
                     && !bold_title()
                 {
-                    findings.push(fine_print_hit(RuleHit::new(
+                    findings.push(fine_print_advisory(RuleHit::new(
                         "tight-leading",
                         format!("line-height {}x (need >=1.3)", to_fixed(ratio, 2)),
                     )));
@@ -2591,10 +2598,8 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
     if has_direct_text && text_len > 20 && font_size < 12.0 {
         let skip_tags = ["sub", "sup", "code", "kbd", "samp", "var", "caption", "figcaption"];
         // A label drawn as a button is UI, unless it is fine print, which
-        // stays tiny-text's advisory (r5-p27).
-        let button_label = || {
-            is_button_box(dom, el) && !*fine_print.get_or_init(|| super::text_context::is_fine_print_dom(dom, el))
-        };
+        // stays tiny-text's (r5-p27; exempt in a legal block).
+        let button_label = || is_button_box(dom, el) && !is_fine_print();
         let in_ui_context = closest_or_none(dom, el, TINY_TEXT_UI_CONTEXT).is_some() || button_label();
         let is_uppercase = st("textTransform") == "uppercase"
             || typed_caps_label(dom, el, q.line_height_px, true);
@@ -2606,12 +2611,13 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
             && !is_code_run
             && !is_non_rendered_text(dom, el, tag)
         {
-            // Fine print and text in a mockup report as advisory.
+            // Fine print and text in a mockup report as advisory; a legal
+            // or footnote block reports nothing.
             let hit = fine_print_hit(RuleHit::new(
                 "tiny-text",
                 format!("{}px body text", number_to_string(font_size)),
             ));
-            findings.push(if hit.is_advisory() { hit } else { advisory_if(hit, in_mock()) });
+            findings.extend(hit.map(|hit| if hit.is_advisory() { hit } else { advisory_if(hit, in_mock()) }));
         }
     }
 
@@ -2656,8 +2662,7 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 // label is functional text at any length, and tiny-text
                 // leaves it to this rule. Fine print is not a label: it
                 // stays tiny-text's advisory (r5-p27).
-                let drawn_as_button = is_button_box(dom, el)
-                    && !*fine_print.get_or_init(|| super::text_context::is_fine_print_dom(dom, el));
+                let drawn_as_button = is_button_box(dom, el) && !is_fine_print();
                 if is_under_ui_text_floor(font_size, floor)
                     && (is_interactive || is_furniture || drawn_as_button || dt_len <= 20)
                 {
