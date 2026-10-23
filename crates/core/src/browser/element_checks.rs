@@ -590,13 +590,18 @@ pub fn read_pseudo_surface_dom(dom: &dyn Dom, el: ElId, rect: &Rect) -> Option<R
         if position != "absolute" && position != "fixed" {
             continue;
         }
-        // JS `(parseFloat(ps.opacity) || 1) < 0.9`
+        // An explicit 0 is 0, as [`read_pseudo_gradient_face`] reads it:
+        // family.co's secondary buttons park a hover face in the text's own
+        // colour at `opacity: 0`, and read at 1 it became the ground the
+        // label was scored on, `1.0:1` (observations-craft-1009 row 5). Only
+        // an opacity the capture did not read counts as 1.
         let opacity = {
-            let n = parse_float(&pseudo_str(dom, el, which, "opacity"));
-            if num_truthy(n) {
-                n
-            } else {
+            let raw = pseudo_str(dom, el, which, "opacity");
+            let n = parse_float(&raw);
+            if js::trim(&raw).is_empty() || !n.is_finite() {
                 1.0
+            } else {
+                n
             }
         };
         if pseudo_str(dom, el, which, "display") == "none" || opacity < 0.9 {
@@ -2381,6 +2386,19 @@ pub fn check_element_colors_dom_in(
     };
     let (text_color, visible_text, effective_bg, effective_bg_stops, own_bg) = painted_colours
         .unwrap_or((text_color, visible_text, effective_bg, effective_bg_stops, own_bg));
+    // Glyphs whose fill is transparent paint no colour of their own: an
+    // ancestor's background clipped to the text paints them (resend.com's
+    // `em` inside a gradient-clipped `h1` inherits its transparent fill), or
+    // nothing does. Their `color` is not what a reader sees.
+    // Only a fill at the floor nothing is seen through counts: a ghost
+    // numeral at 5% white is still ink (reachmcp.com).
+    let ink_unread = has_direct_text && {
+        let fill = dom.style(ink_el, "webkitTextFillColor");
+        let fill = if js::trim(&fill).is_empty() { dom.style(ink_el, "color") } else { fill };
+        js::trim(&fill) == "transparent"
+            || parse_rgb_or_any(&fill)
+                .is_some_and(|c| c.alpha_or_one() <= crate::checks::rules::TRANSPARENT_INK_FLOOR)
+    };
     let mut color_opts = ColorOpts {
         tag: tag.clone(),
         text_color,
@@ -2405,6 +2423,7 @@ pub fn check_element_colors_dom_in(
         bg_source,
         bg_source_host,
         same_color_surface_is_unread,
+        ink_unread,
     };
     // Only on the link and span path: a styled control takes the full pass,
     // which keeps its own reading of the page ground.
@@ -2481,7 +2500,7 @@ pub fn check_element_colors_dom_in(
             TextLayers::UnreadSurface => !own_surface && unread() == UnreadVerdict::Fails,
             layers => {
                 own_surface
-                    || !crate::browser::visual::surface_unread(dom, under(), resolved_surface, layers)
+                    || !crate::browser::visual::surface_unread(dom, el, under(), resolved_surface, layers)
                     || unread() != UnreadVerdict::Passes
             }
         }
@@ -2552,7 +2571,7 @@ pub fn check_element_colors_dom_in(
     if findings.iter().any(|h| h.id == "low-contrast")
         && !own_surface
         && (layers_at() == crate::browser::text_layers::TextLayers::UnreadSurface
-            || crate::browser::visual::surface_unread(dom, under(), resolved_surface, layers_at()))
+            || crate::browser::visual::surface_unread(dom, el, under(), resolved_surface, layers_at()))
     {
         if let Some(rescore) = reading().rescore {
             for h in findings.iter_mut().filter(|h| h.id == "low-contrast") {
@@ -11994,6 +12013,53 @@ mod tests {
         assert!(!run(strip, "auto", white));
         assert!(run(strip, "8px 8px", white), "a small tile is a texture over the fill");
         assert!(run(strip, "auto", "rgb(225, 121, 121)"), "ink in another colour keeps its verdict");
+    }
+
+    /// family.co's `ButtonSecondary`: a hover face in the label's own colour
+    /// parked at `opacity: 0` is not the ground at rest; the same face shown
+    /// is, and a failing label on it still reports.
+    #[test]
+    fn a_hover_face_at_opacity_zero_is_not_the_surface() {
+        let run = |face: &str, opacity: &str| {
+            let (mut d, body) = page();
+            let b = d.add(Some(body), "div");
+            visible(&mut d, b);
+            d.add_text(b, "Download");
+            d.set_rect(b, 40.0, 600.0, 160.0, 44.0);
+            d.set_styles(
+                b,
+                &[
+                    ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                    ("color", "rgb(110, 110, 110)"),
+                    ("fontSize", "16px"),
+                    ("fontWeight", "500"),
+                    ("position", "relative"),
+                ],
+            );
+            for (p, v) in [
+                ("content", "\"\""),
+                ("position", "absolute"),
+                ("display", "block"),
+                ("backgroundColor", face),
+                ("backgroundImage", "none"),
+                ("top", "0px"),
+                ("left", "0px"),
+                ("width", "160px"),
+                ("height", "44px"),
+                ("opacity", opacity),
+            ] {
+                d.set_pseudo_style(b, "::before", p, v);
+            }
+            colors(&d, b).into_iter().filter(|h| h.id == "low-contrast").map(|h| h.snippet).collect::<Vec<_>>()
+        };
+        // The grey label passes on the white page it sits on.
+        assert!(run("rgb(110, 110, 110)", "0").is_empty(), "{:?}", run("rgb(110, 110, 110)", "0"));
+        // Shown, a grey face under it fails, scored on the face.
+        let shown = run("rgb(200, 200, 200)", "1");
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(shown[0].contains("on #c8c8c8"), "{}", shown[0]);
+        // An opacity the capture did not read counts as shown.
+        assert_eq!(run("rgb(200, 200, 200)", "").len(), 1);
     }
 
     /// observations-47 row 12, ardainc.com 322246: the CTA paints a conic
