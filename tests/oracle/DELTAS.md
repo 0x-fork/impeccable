@@ -7216,3 +7216,7 @@ ordinary goldens again, not accepted deltas. The new cases
 `live-inject-csp-meta-quote-styles` and `live-inject-csp-meta-quote-styles-remove`
 pin the in-place patch of the raw content value (references kept, inserted
 sources encoded for the quote style) and the round trip.
+
+## Recorded 2026-10-23: unknown named references in a CSP meta are text
+
+The CSP meta patch read any `&name;` outside its 29 ASCII names as one opaque unit, so in `img-src https://a.example/?a&b; script-src 'self'` the `;` after `&b` was hidden: `blob:` was appended to the policy's last directive and a second `script-src` was added. A browser reads `&b;` as text, because `b` is no HTML named reference, and that `;` ends `img-src`. The patch now decides from the full HTML named-reference table (markup5ever's `NAMED_ENTITIES`, the same table as html5ever): a name that decodes to ASCII is that character, any other real name is one opaque unit, an unknown name is plain text, and a legacy name without `;` decodes unless an alphanumeric or `=` follows. New cases `live-inject-csp-meta-unknown-reference` and `live-inject-csp-meta-unknown-reference-remove`, recorded from a release build of the binary and reviewed by hand: `blob:` joins `img-src`, the existing `script-src` gains the origin and `'wasm-unsafe-eval'`, `connect-src` is added once, and remove restores the file byte for byte. No existing golden moved.
