@@ -1211,12 +1211,11 @@ fn pattern_finding_stands(
     if !super::painted::page_form_painted(dom, &f.id, &matches) {
         return None;
     }
-    // A stripe rule inside an `@media` or `@supports` block that does not
-    // apply, or one a later rule overrides, paints nothing on the element
-    // it names: its computed image must carry a repeating gradient.
-    if f.id == "repeating-stripes-gradient"
-        && !matches.iter().any(|&el| repeating_gradient_applies(dom, el, selector))
-    {
+    // A stripe, glow, halo or grid rule inside an `@media` or `@supports`
+    // block that does not apply, or one a later rule overrides, paints
+    // nothing on the element it names: the element's computed style must
+    // carry what the rule declares ([`computed_paint_applies`]).
+    if !matches.iter().any(|&el| computed_paint_applies(dom, el, selector, &f.id, &f.snippet)) {
         return None;
     }
     // A stripe on any edge from the style-text scans reports only
@@ -1236,30 +1235,65 @@ fn pattern_finding_stands(
     Some(Some(matches))
 }
 
-/// Whether the box a stripe selector names on `el` computes a repeating
-/// gradient as its background or mask image: the `::before` / `::after`
-/// box for a part of the selector list that names one, `el` itself for a
-/// part that does not. A value the Dom did not record answers yes: a host
-/// with none of its images recorded, or a pseudo-element whose mask the
-/// capture predates.
-fn repeating_gradient_applies(dom: &dyn Dom, el: ElId, selector: &str) -> bool {
-    let repeats = |v: &str| v.to_ascii_lowercase().contains("repeating-");
-    let host = || {
-        let values = [
-            dom.style(el, "backgroundImage"),
-            dom.style(el, "maskImage"),
-            dom.style(el, "webkitMaskImage"),
-        ];
-        values.iter().all(|v| v.is_empty()) || values.iter().any(|v| repeats(v))
+/// Whether the box a pattern rule's selector names on `el` computes what
+/// the rule declares: the `::before` / `::after` box for a part of the
+/// selector list that names one, `el` itself for a part that does not.
+/// A stripe needs a repeating gradient as its background or mask image, a
+/// radial halo a radial gradient as its background image, a grid-line
+/// background a gradient as its background image, and a glow the shadow
+/// property its snippet names. A value the Dom did not record answers yes:
+/// a host with none of the properties recorded, a pseudo-element whose mask
+/// the capture predates, or the pseudo-element of a glow, halo or grid.
+/// Other rules answer yes.
+fn computed_paint_applies(dom: &dyn Dom, el: ElId, selector: &str, rule: &str, snippet: &str) -> bool {
+    let has = |v: &str, needle: &str| v.to_ascii_lowercase().contains(needle);
+    let drawn = |v: &str| v != "none" && v != "initial";
+    let shadow_props: &[&str] = if snippet.contains("text-shadow") {
+        &["textShadow"]
+    } else {
+        &["boxShadow"]
     };
+    // Read off the host, or off a pseudo-element (`pseudo`) through `read`.
+    let applies = |read: &dyn Fn(&str) -> String, pseudo: bool| match rule {
+        "repeating-stripes-gradient" if pseudo => {
+            let mask = read("maskImage");
+            mask.is_empty() || has(&mask, "repeating-") || has(&read("backgroundImage"), "repeating-")
+        }
+        "repeating-stripes-gradient" => {
+            let values = [read("backgroundImage"), read("maskImage"), read("webkitMaskImage")];
+            values.iter().all(|v| v.is_empty()) || values.iter().any(|v| has(v, "repeating-"))
+        }
+        "radial-halo" => {
+            let image = read("backgroundImage");
+            image.is_empty() || has(&image, "radial-gradient")
+        }
+        "codex-grid-background" => {
+            let image = read("backgroundImage");
+            image.is_empty() || has(&image, "gradient")
+        }
+        "dark-glow" => shadow_props.iter().any(|p| {
+            let v = read(p);
+            v.is_empty() || drawn(&v)
+        }),
+        _ => true,
+    };
+    if !matches!(rule, "repeating-stripes-gradient" | "radial-halo" | "codex-grid-background" | "dark-glow") {
+        return true;
+    }
+    let host = || applies(&|prop: &str| dom.style(el, prop), false);
     let pseudo = |name: &str| {
-        let read = |prop: &str| dom.pseudo_style(el, name, prop).unwrap_or_default();
-        let content = read("content");
+        // The capture records a pseudo-element only where its `content`
+        // is a non-empty value, so the `content: ''` box a glow, halo or
+        // grid decoration is usually drawn on reads as `none`: unrecorded,
+        // which answers yes.
+        if rule != "repeating-stripes-gradient" {
+            return true;
+        }
+        let content = dom.pseudo_style(el, name, "content").unwrap_or_default();
         if content == "none" || content == "normal" {
             return false;
         }
-        let mask = read("maskImage");
-        mask.is_empty() || repeats(&mask) || repeats(&read("backgroundImage"))
+        applies(&|prop: &str| dom.pseudo_style(el, name, prop).unwrap_or_default(), true)
     };
     selector_list_pseudos(selector).into_iter().any(|part| match part {
         Some(name) => pseudo(name),
@@ -3193,6 +3227,68 @@ mod tests {
         );
     }
 
+    /// #1076: a glow, a radial halo or a grid-line background declared for a
+    /// visible element inside an `@media` block that does not apply paints
+    /// nothing there either, so it hides no later candidate the page shows.
+    #[test]
+    fn a_glow_halo_or_grid_rule_the_element_does_not_compute_is_passed_over() {
+        // (rule, the inactive candidate's declaration, the active one's, the
+        // computed property, what an element under the active rule computes)
+        let cases = [
+            (
+                "dark-glow",
+                "box-shadow: 0 0 24px rgba(255, 0, 255, 0.8)",
+                "box-shadow: 0 0 24px rgba(0, 169, 255, 0.8)",
+                "boxShadow",
+                "rgba(0, 169, 255, 0.8) 0px 0px 24px 0px",
+            ),
+            (
+                "radial-halo",
+                "background: radial-gradient(circle, #ff00ff 0%, transparent 70%)",
+                "background: radial-gradient(circle, #00a9ff 0%, transparent 70%)",
+                "backgroundImage",
+                "radial-gradient(circle, rgb(0, 169, 255) 0%, rgba(0, 0, 0, 0) 70%)",
+            ),
+            (
+                "codex-grid-background",
+                "background-image: linear-gradient(90deg, #fff 1px, transparent 1px), linear-gradient(#fff 1px, transparent 1px); background-size: 24px 24px",
+                "background-image: linear-gradient(90deg, #fff 1px, transparent 1px), linear-gradient(#fff 1px, transparent 1px); background-size: 32px 32px",
+                "backgroundImage",
+                "linear-gradient(90deg, rgb(255, 255, 255) 1px, rgba(0, 0, 0, 0) 1px), linear-gradient(rgb(255, 255, 255) 1px, rgba(0, 0, 0, 0) 1px)",
+            ),
+        ];
+        for (rule, inactive, active, prop, computed) in cases {
+            let run = |with_active: bool| {
+                let mut d = FakeDom::new();
+                let (html, body) = d.with_page();
+                d.set_rect(html, 0.0, 0.0, 1280.0, 2000.0);
+                d.set_rect(body, 0.0, 0.0, 1280.0, 2000.0);
+                d.el_mut(html).scroll_width = 1280.0;
+                for (selector, y, value) in [(".wide", 100.0, "none"), (".on", 300.0, computed)] {
+                    let el = d.add(Some(body), "div");
+                    d.add_selector(el, selector);
+                    d.set_rect(el, 0.0, y, 320.0, 120.0);
+                    d.set_styles(el, &[(prop, value), ("textShadow", "none")]);
+                }
+                let tail = if with_active { format!(".on {{ {active} }}") } else { String::new() };
+                d.html_for_patterns = format!(
+                    "<html><head><style>body{{background:#0b0b0f}}\
+@media (min-width: 4000px) {{ .wide {{ {inactive} }} }}\
+{tail}</style></head><body><div class=\"wide\"></div><div class=\"on\"></div></body></html>"
+                );
+                scoped_html_pattern_findings(&d)
+                    .into_iter()
+                    .filter(|f| f.type_ == rule)
+                    .map(|f| f.detail)
+                    .collect::<Vec<_>>()
+            };
+            assert!(run(false).is_empty(), "{rule}: {:?}", run(false));
+            let found = run(true);
+            assert_eq!(found.len(), 1, "{rule}: {found:?}");
+            assert!(!found[0].contains("#ff00ff"), "{rule}: {found:?}");
+        }
+    }
+
     /// Fourth review of #1042: a selector list splits on its top-level
     /// commas only, and a pseudo-element counts only outside quotes,
     /// brackets and parentheses.
@@ -3225,8 +3321,8 @@ mod tests {
         d.set_pseudo_style(el, "::before", "content", "\"\"");
         d.set_pseudo_style(el, "::before", "backgroundImage", "none");
         d.set_pseudo_style(el, "::before", "maskImage", "none");
-        assert!(repeating_gradient_applies(&d, el, "[data-icon=\":before\"]"));
-        assert!(!repeating_gradient_applies(&d, el, ":is(.a, .b)::before"));
+        assert!(computed_paint_applies(&d, el, "[data-icon=\":before\"]", "repeating-stripes-gradient", ""));
+        assert!(!computed_paint_applies(&d, el, ":is(.a, .b)::before", "repeating-stripes-gradient", ""));
     }
 
     /// Third review of #1042: a `::before` stripe is judged by the

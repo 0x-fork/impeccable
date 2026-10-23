@@ -262,7 +262,15 @@ re!(
 
 /// JS: checks.mjs#scanCssTextForGridBackground
 pub fn scan_css_text_for_grid_background(content: &str) -> Vec<IndexedHit> {
-    for blk in GRID_BLOCK_RE.captures_iter(content) {
+    grid_background_hits(content).take(1).collect()
+}
+
+/// Every block of `content` that paints a two-axis grid-line background, in
+/// source order, read lazily: [`scan_css_text_for_grid_background`] keeps
+/// the first, and a walk that picks the first candidate the page shows
+/// reads on only past one it passes over.
+pub fn grid_background_hits(content: &str) -> impl Iterator<Item = IndexedHit> + '_ {
+    GRID_BLOCK_RE.captures_iter(content).filter_map(|blk| {
         let block = blk
             .get(1)
             .or_else(|| blk.get(2))
@@ -282,20 +290,17 @@ pub fn scan_css_text_for_grid_background(content: &str) -> Vec<IndexedHit> {
             bg_joined.push(';');
         }
         if hairline_count == 0 {
-            continue;
+            return None;
         }
         let has_px_cell =
             SIZE_DECL_PX_RE.is_match(block) || SHORTHAND_PX_ANY_RE.is_match(&bg_joined);
         // A single hairline is a line, divider, or rail, not a grid, even
         // when tiled by a 2D px cell (issue #615).
-        if hairline_count >= 2 && has_px_cell {
-            return vec![IndexedHit {
-                index: blk.get(0).unwrap().start(),
-                snippet: "two-axis grid-line gradient background".to_string(),
-            }];
-        }
-    }
-    Vec::new()
+        (hairline_count >= 2 && has_px_cell).then(|| IndexedHit {
+            index: blk.get(0).unwrap().start(),
+            snippet: "two-axis grid-line gradient background".to_string(),
+        })
+    })
 }
 
 // ─── scanCssTextForRadialHalo ───────────────────────────────────────────────
@@ -3244,6 +3249,20 @@ mod tests {
                 "{text:?} @ {idx}"
             );
         }
+        // #1076: a quoted brace or semicolon in an at-rule's header does
+        // not cut the header short, so the rule inside keeps its selector.
+        for text in [
+            "@supports (content: \"}\") { .b { c: d } }",
+            "@supports (content: \"{\") { .b { c: d } }",
+            "@supports (content: \"a;b\") { .b { c: d } }",
+            "@media (x) { @supports (content: 'x;y') { .b { c: d } } }",
+        ] {
+            let idx = text.find("c: d").unwrap();
+            assert_eq!(enclosing_css_selector(text, idx).as_deref(), Some(".b"), "{text:?}");
+        }
+        // A quoted semicolon still ends nothing in a rule nested in a style rule.
+        let nested = ".card { content: \"a;b\"; @media (x) { .s { c: d } } }";
+        assert_eq!(enclosing_css_selector(nested, nested.find("c: d").unwrap()), None);
     }
 
     #[test]

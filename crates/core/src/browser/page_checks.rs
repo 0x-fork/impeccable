@@ -1146,11 +1146,8 @@ fn is_media_player(dom: &dyn Dom, el: ElId, rect: &Rect) -> bool {
 fn occlusion_victim_without_ink(dom: &dyn Dom, el: ElId) -> bool {
     // Set at 1px, but drawn larger by a transform: `scale(16)` paints
     // readable letters.
-    if super::painted::at_most_1px(&dom.style(el, "fontSize")) {
-        let drawn = js::parse_float(&dom.style(el, "fontSize")) * super::painted::drawn_enlargement(dom, el);
-        if drawn <= 1.0 {
-            return true;
-        }
+    if super::painted::drawn_at_most_1px(dom, el) {
+        return true;
     }
     let fill = dom.style(el, "webkitTextFillColor");
     let fill = if js::trim(&fill).is_empty() { dom.style(el, "color") } else { fill };
@@ -4769,7 +4766,7 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
                 continue;
             }
             let top_own_text = !element_direct_text(dom, top).is_empty()
-                && !super::painted::at_most_1px(&dom.style(top, "fontSize"))
+                && !super::painted::drawn_at_most_1px(dom, top)
                 && glyphs_may_cover(top_glyphs, victim_glyphs.as_ref(), x, y);
             // Under text that ignores pointer events the probe passes
             // through to what lies beneath, so a graphic it names may be the
@@ -7488,7 +7485,7 @@ mod tests {
     /// link carries its label at `font-size: 0`.
     #[test]
     fn text_occlusion_counts_text_only_where_its_glyphs_are() {
-        let run = |text_rect: Option<(f64, f64)>, font_size: &str| {
+        let run_scaled = |text_rect: Option<(f64, f64)>, font_size: &str, scale: &str| {
             let mut d = FakeDom::new();
             let (_h, body) = d.with_page();
             let overlay = d.add(Some(body), "div");
@@ -7502,7 +7499,7 @@ mod tests {
             d.add_text(topic, "Faits divers");
             let link = d.add(Some(overlay), "a");
             d.set_styles(link, PROBE_BASE);
-            d.set_styles(link, &[("position", "absolute"), ("fontSize", font_size)]);
+            d.set_styles(link, &[("position", "absolute"), ("fontSize", font_size), ("scale", scale)]);
             // The rect the hit test answers for: the overlay's whole card.
             d.set_rect(link, 85.0, 700.0, 665.0, 280.0);
             d.add_text(link, "Messe polémique à Carcassonne");
@@ -7512,6 +7509,7 @@ mod tests {
             mark_body_descendants(&mut d);
             check_text_occlusion_dom(&d)
         };
+        let run = |text_rect: Option<(f64, f64)>, font_size: &str| run_scaled(text_rect, font_size, "none");
         // The title's glyphs sit at y 800; the topic at y 710 is not under them.
         assert!(run(Some((95.0, 800.0)), "16px").is_empty());
         // Glyphs over the topic, and a text rect the capture did not record,
@@ -7520,6 +7518,10 @@ mod tests {
         assert_eq!(run(None, "16px").len(), 1);
         // A label at font-size 0 draws nothing.
         assert!(run(None, "0px").is_empty());
+        // #1076: a 1px label draws nothing either, unless a transform draws
+        // it at a readable size: `font-size: 1px` under `scale: 16` is text.
+        assert!(run(None, "1px").is_empty());
+        assert_eq!(run_scaled(None, "1px", "16").len(), 1);
     }
 
     /// observations-35 row 15 (freenet.de 218507): a 40px price on a 40px

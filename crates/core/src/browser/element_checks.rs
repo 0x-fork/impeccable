@@ -5489,9 +5489,13 @@ pub fn check_element_text_overflow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> 
     if is_scroll_region(dom, el) {
         return Vec::new();
     }
+    // A scroll region holds what overflows it, except that code in a page
+    // shell that scrolls (`#app { overflow: auto }` around the whole page)
+    // runs off the screen edge like code on an unwrapped page, so the
+    // shell does not speak for it and the code tests below decide.
     let mut p = dom.parent(el);
     while let Some(pp) = p {
-        if is_scroll_region(dom, pp) {
+        if is_scroll_region(dom, pp) && !(clipping_container_is_page_shell(dom, pp) && is_code_text(dom, el)) {
             return Vec::new();
         }
         p = dom.parent(pp);
