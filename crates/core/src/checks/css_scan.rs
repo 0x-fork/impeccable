@@ -2393,6 +2393,41 @@ fn sample_arc(
         .collect()
 }
 
+/// The vertex count of a `polygon()` body (the text between its
+/// parentheses) that approximates an organic contour, the shape the
+/// organic-clip-path rule reports: at least [`ORGANIC_POLYGON_MIN_VERTICES`]
+/// comma-separated points (a leading fill rule counts as one, as the rule
+/// has always counted it), every coordinate off a 25% grid on average, and
+/// neither rectilinear nor a zigzag. `None` otherwise.
+pub(crate) fn organic_polygon_vertices(body: &str) -> Option<usize> {
+    let points: Vec<&str> = body
+        .split(',')
+        .map(js::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if points.len() < ORGANIC_POLYGON_MIN_VERTICES {
+        return None;
+    }
+    // Vertices sitting on a coarse grid (multiples of 25%) are geometric;
+    // a contour has arbitrary values.
+    let mut off_grid = 0usize;
+    for p in &points {
+        for n in SIGNED_NUM_RE.find_iter(p) {
+            let v = parse_float(n.as_str());
+            if (v - js::math_round(v / 25.0) * 25.0).abs() > 0.5 {
+                off_grid += 1;
+            }
+        }
+    }
+    if off_grid < points.len() {
+        return None;
+    }
+    if polygon_is_rectilinear(body) || polygon_is_zigzag(body) {
+        return None;
+    }
+    Some(points.len())
+}
+
 /// JS: checks.mjs#scanCssTextForOrganicClipPath
 ///
 /// The same declaration repeated (one inline style per button) reports once
@@ -2425,36 +2460,14 @@ pub fn scan_css_text_for_organic_clip_path(style_text: &str) -> Vec<PatternFindi
             });
             continue;
         }
-        let points: Vec<&str> = body
-            .split(',')
-            .map(js::trim)
-            .filter(|p| !p.is_empty())
-            .collect();
-        if points.len() < ORGANIC_POLYGON_MIN_VERTICES {
+        let Some(vertices) = organic_polygon_vertices(body) else {
             continue;
-        }
-        // Vertices sitting on a coarse grid (multiples of 25%) are geometric;
-        // a contour has arbitrary values.
-        let mut off_grid = 0usize;
-        for p in &points {
-            for n in SIGNED_NUM_RE.find_iter(p) {
-                let v = parse_float(n.as_str());
-                if (v - js::math_round(v / 25.0) * 25.0).abs() > 0.5 {
-                    off_grid += 1;
-                }
-            }
-        }
-        if off_grid < points.len() {
-            continue;
-        }
-        if polygon_is_rectilinear(body) || polygon_is_zigzag(body) {
-            continue;
-        }
+        };
         push(&mut findings, PatternFinding {
             id: "organic-clip-path".to_string(),
             snippet: format!(
                 "clip-path: polygon() with {} vertices approximating an organic contour",
-                points.len()
+                vertices
             ),
             selector: enclosing_css_selector(style_text, index),
             index: None,
