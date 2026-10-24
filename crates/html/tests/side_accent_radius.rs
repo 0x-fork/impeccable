@@ -336,3 +336,19 @@ fn an_unread_stylesheet_keeps_a_card_it_never_saw_a_radius_for() {
     )
     .is_empty());
 }
+
+#[test]
+fn a_row_stripe_reports_only_where_its_selector_matches_a_cell() {
+    let count = |cls: &str| {
+        let html = format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>t</title>\
+<style>td.is-x:not(.plain){{box-shadow:inset 3px 0 0 #d0342c;}}</style></head>\
+<body><table><tr><td class=\"is-x {cls}\">a</td></tr></table></body></html>"
+        );
+        let findings = detect_html_source(&html, Path::new("/nonexistent/dir/page.html"), &DetectHtmlOptions::default());
+        let value = serde_json::to_value(&findings).unwrap();
+        value.as_array().unwrap().iter().filter(|f| f["antipattern"] == "side-tab").count()
+    };
+    assert_eq!(count("plain"), 0);
+    assert_eq!(count("other"), 1);
+}
