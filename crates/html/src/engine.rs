@@ -458,7 +458,27 @@ pub fn detect_html_source(
             if doc.compile(query).is_err() {
                 continue;
             }
-            let hosts = doc.query_selector_all(query);
+            // A row by class only that may be rounded (another rule's
+            // radius, or one the engine cannot see) is a card, and the card
+            // scans above report it: a table or ARIA row or cell is a row
+            // whatever its corners.
+            let hosts: Vec<_> = doc
+                .query_selector_all(query)
+                .into_iter()
+                .filter(|el| {
+                    let tag = el.tag_lower();
+                    let role = el.get_attribute("role").unwrap_or("").to_ascii_lowercase();
+                    if matches!(tag.as_str(), "tr" | "td" | "th")
+                        || matches!(role.as_str(), "row" | "cell" | "gridcell" | "rowheader")
+                    {
+                        return true;
+                    }
+                    let style = el.style();
+                    resolve_side_accent_corners(el, style, pf0(sv(style, "width"))).is_some_and(|c| {
+                        [c.top_left, c.top_right, c.bottom_right, c.bottom_left].iter().all(|r| *r <= 0.0)
+                    })
+                })
+                .collect();
             if hosts.is_empty() || hosts.iter().all(|el| scoped_ignore_active(el, &f.id)) {
                 continue;
             }
