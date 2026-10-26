@@ -39,6 +39,7 @@
   },
   "files": [
     "cli/bin/",
+    "skill/scripts/engine-checksums.txt",
     "LICENSE"
   ],
   "scripts": {
