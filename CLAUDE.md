@@ -325,6 +325,8 @@ The skill launcher, the npm shim (`cli/bin/cli.js`), and `impeccable install` al
 
 `scripts/check-engine-release.mjs` verifies step 1 and 2 for the pinned version (ranged-GET each release asset, registry-probe each npm package, compare `skill/scripts/engine-checksums.txt` with each published `.sha256`; honors `IMPECCABLE_DOWNLOAD_BASE`). It exits non-zero and names exactly which assets are missing. `scripts/release.mjs` runs it as a hard gate before tagging the **skill** and **CLI** components and refuses to proceed when any asset is absent; the **extension** release is exempt because it ships a vendored WASM detector and never execs the engine. `IMPECCABLE_SKIP_ENGINE_CHECK=1` bypasses the gate only for the case where the assets exist but the registry probe is unreachable. CI's `engine-release-ready` job runs the same script as a hard gate, so missing release assets fail CI.
 
+`scripts/release.mjs` also refuses a **skill** or **CLI** tag when anything under `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or a file the crates compile in from outside the workspace (its `ENGINE_SOURCE_PATHS` list) differs from the `engine-v<ENGINE_VERSION>` tag, because the binary users download is built from that tag: bump `ENGINE_VERSION` and release the engine first. `IMPECCABLE_SKIP_ENGINE_SOURCE_CHECK=1` bypasses it only for changes that cannot reach the binary, such as test-only edits.
+
 ## Adding New Commands
 
 All commands live under `/impeccable`. To add a new one:
