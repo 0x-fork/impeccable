@@ -108,6 +108,93 @@ fn is_in_control(dom: &dyn Dom, el: ElId) -> bool {
     }
     false
 }
+/// The SVG elements that draw text.
+const SVG_TEXT_TAGS: &[&str] = &["text", "tspan", "textpath"];
+
+/// The scale the nearest `svg` around `el` draws its user units at: its
+/// rendered content box (padding and borders left out) over its `viewBox`
+/// size, the smaller of the two axes as
+/// the default `preserveAspectRatio` (`meet`) fits it, the larger under
+/// `slice`, and the vertical axis, which sets glyph height, under `none`.
+/// A `transform` on the text or on a box between it and the `svg` (the
+/// computed value, else the attribute) multiplies in when it scales evenly,
+/// or only moves or turns the text. `None` where the `svg` has no usable
+/// `viewBox` or no measured box, or a transform between skews, tilts or
+/// scales the axes apart, so the computed size stands.
+fn svg_text_scale(dom: &dyn Dom, el: ElId) -> Option<f64> {
+    let svg = closest_or_none(dom, el, "svg")?;
+    let mut inner = 1.0;
+    let mut cur = Some(el);
+    for _ in 0..32 {
+        let Some(c) = cur else { return None };
+        if c == svg {
+            break;
+        }
+        let computed = dom.style(c, "transform");
+        let value = if computed.trim().is_empty() || computed.trim() == "none" {
+            dom.attr(c, "transform").unwrap_or_default()
+        } else {
+            computed
+        };
+        let value = value.trim().to_ascii_lowercase();
+        if !value.is_empty() && value != "none" {
+            let t = crate::checks::text_context::read_transform(&value);
+            if t.tilt_3d || value.contains("skew") {
+                return None;
+            }
+            if value.contains("scale") || value.contains("matrix") {
+                inner *= t.uniform_scale?;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    let view_box = dom.attr(svg, "viewBox")?;
+    let parts: Vec<f64> = view_box
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<f64>().unwrap_or(f64::NAN))
+        .collect();
+    let [_, _, vw, vh] = parts[..] else { return None };
+    // The viewBox fills the content box: padding and borders draw nothing.
+    // They are layout px, and the rect is drawn px, so they come off only
+    // where the rect matches the layout box (content-box or border-box
+    // sizing, untransformed); a transformed box with an inset keeps the
+    // computed size.
+    let r = dom.rect(svg);
+    let inset = |a: &str, b: &str, c: &str, d: &str| {
+        style_px(dom, svg, a) + style_px(dom, svg, b) + style_px(dom, svg, c) + style_px(dom, svg, d)
+    };
+    let content = |drawn: f64, declared: &str, inset: f64| -> Option<f64> {
+        if inset <= 0.0 {
+            return Some(drawn);
+        }
+        let css = style_px(dom, svg, declared);
+        if (css + inset - drawn).abs() <= 1.0 {
+            Some(css)
+        } else if (css - drawn).abs() <= 1.0 {
+            Some(css - inset)
+        } else {
+            None
+        }
+    };
+    let width = content(r.width, "width", inset("paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth"))?;
+    let height = content(r.height, "height", inset("paddingTop", "paddingBottom", "borderTopWidth", "borderBottomWidth"))?;
+    if !(vw.is_finite() && vh.is_finite() && vw > 0.0 && vh > 0.0 && width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let (sx, sy) = (width / vw, height / vh);
+    let fit = dom.attr(svg, "preserveAspectRatio").unwrap_or_default().to_ascii_lowercase();
+    let scale = if fit.trim_start().starts_with("none") {
+        sy
+    } else if fit.contains("slice") {
+        sx.max(sy)
+    } else {
+        sx.min(sy)
+    };
+    let scale = scale * inner;
+    scale.is_finite().then_some(scale).filter(|s| *s > 0.0)
+}
+
 /// Whether a class token names a button: `btn` itself, or a name ending in
 /// `-btn`, `__btn` or `_btn` (`features-demo__btn`). A wrapper that holds
 /// buttons (`btn-group`, `hero-btns`) does not.
@@ -2809,7 +2896,16 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
     // (adant.ai's "ANIMATION · CINEMATIC 3D" card meta), and neither is a
     // command set in a monospace face with its whitespace kept (stroq.dev's
     // terminal mock), which is code whatever its class names.
-    if has_direct_text && text_len > 20 && font_size < 12.0 {
+    // SVG text is drawn at its computed size times the scale its `svg`
+    // takes from the viewBox (row 16, round 14): quoin.ai's 10.5px labels in
+    // a 360-unit diagram drawn 411px wide land at about 12px.
+    let svg_drawn = if has_direct_text && text_len > 20 && SVG_TEXT_TAGS.contains(&tag) {
+        svg_text_scale(dom, el).map(|scale| font_size * scale)
+    } else {
+        None
+    };
+    let tiny_size = svg_drawn.unwrap_or(font_size);
+    if has_direct_text && text_len > 20 && tiny_size < 12.0 {
         let skip_tags = ["sub", "sup", "code", "kbd", "samp", "var", "caption", "figcaption"];
         // A label drawn as a button is UI, unless it is fine print, which
         // stays tiny-text's (r5-p27; exempt in a legal block).
