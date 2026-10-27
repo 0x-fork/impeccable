@@ -1256,7 +1256,7 @@ fn names_close_control_dom(dom: &dyn Dom, el: ElId) -> bool {
 /// Whether the element lies wholly within the page's width, give or take a
 /// pixel. A marquee's first copy starting past the left edge, or a card cut
 /// by a carousel's right edge, is only partly readable.
-fn wholly_within_page_width(dom: &dyn Dom, rect: &Rect) -> bool {
+pub(crate) fn wholly_within_page_width(dom: &dyn Dom, rect: &Rect) -> bool {
     let width = dom.inner_width();
     if !num_truthy(width) {
         return true;

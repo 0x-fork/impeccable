@@ -235,22 +235,15 @@ fn the_rule_pass_skips_what_is_not_painted() {
         ("tight-leading", "#flag-submenu-copy"),
         ("low-contrast", "#flag-scroller-first"),
         ("tight-leading", "#flag-roomy-copy"),
-        ("low-contrast", "#flag-crossfade-copy"),
         ("buried-raster", "#flag-buried-photo"),
         // An absolute popover escapes a clip below its containing block.
         ("undersized-ui-text", "#flag-popover-link"),
-        // Reached by scrolling the shell's main, under a wrapper that hides
-        // overflow.
-        ("low-contrast", "#flag-shell-below-fold"),
         // A transition utility alone does not make a buried image a state.
         ("buried-raster", "#flag-tw-buried-photo"),
         // Nor does a lazy-load marker on an image held at a faint value
         // other than 0: a fade starts from 0.
         ("buried-raster", "#flag-lazy-tw-buried-photo"),
         ("buried-raster", "#flag-lazy-fade-buried-photo"),
-        // A viewport-tall frame that hides overflow is how a smooth-scroll
-        // library scrolls the page, so the content below its fold is kept.
-        ("low-contrast", "#flag-smooth-below-fold"),
         // A fixed badge inside a containing block sits against it, not
         // against the viewport.
         ("undersized-ui-text", "#flag-cb-will-link"),
@@ -272,6 +265,19 @@ fn the_rule_pass_skips_what_is_not_painted() {
     ] {
         assert!(flagged.contains(&want), "missing {want:?} in {flagged:?}");
     }
+    // The faint #bbbbbb copy is one colour pair, reported once by the first
+    // scroller cell and counted (r14-t2). The three more are the crossfade
+    // copy, the copy reached by scrolling the shell's main under a wrapper
+    // that hides overflow, and the copy below a smooth-scroll frame's fold
+    // (a viewport-tall frame that hides overflow is how such a library
+    // scrolls the page). None of the unpainted pass cases wearing the pair
+    // is counted.
+    assert!(
+        findings.iter().any(|f| f.antipattern == "low-contrast"
+            && f.extras.get("selector").and_then(|v| v.as_str()) == Some("#flag-scroller-first")
+            && f.snippet.ends_with("text #bbbbbb on #ffffff (and 3 more)")),
+        "{flagged:?}"
+    );
     for (rule, unwanted) in [
         // Screen-reader text inside a 1px box its clip removes.
         ("undersized-ui-text", "#pass-sr-copy"),

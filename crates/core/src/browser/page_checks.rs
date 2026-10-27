@@ -1356,7 +1356,7 @@ const PAGE_FRAME_MIN_HEIGHT_SHARE: f64 = 0.75;
 /// wraps the whole page in `div#outer-wrapper` with a Tailwind
 /// `ring-black/5`, and the cards on the page sat inside it as inner cards.
 /// A page whose width or height the capture did not measure has no frame.
-fn is_page_frame(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn is_page_frame(dom: &dyn Dom, el: ElId) -> bool {
     let Some(root) = dom.document_element() else { return false };
     let client = dom.client_width(root);
     let vw = if client.is_finite() && client > 0.0 { client } else { dom.inner_width() };

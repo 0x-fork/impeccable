@@ -1299,6 +1299,9 @@ fn scan_loaded(
     // the in-page bundle's `impeccableDetect({ serialize: true })` produced; the
     // group selectors feed the visual pass below.
     let mut serialized_groups: Vec<Value> = Vec::new();
+    // Copies whose verdict a counted finding speaks for (` (and N more)`):
+    // the visual pass treats them as reported.
+    let mut collapsed_selectors: Vec<String> = Vec::new();
     let mut results = step_findings(profile, "scan", "browser-scan", url, || {
         let facts = evidence.as_mut().map(|(ev, _)| &mut ev.scan_facts);
         // Which verdicts the element pass hands to the pixels is decided here,
@@ -1319,6 +1322,11 @@ fn scan_loaded(
             .as_array()
             .cloned()
             .unwrap_or_default();
+        collapsed_selectors = collected
+            .collapsed
+            .iter()
+            .map(|el| impeccable_core::browser::driver::generate_selector(&base, *el))
+            .collect();
         let mut results = results_from_groups(&serialized_groups);
         hand_over(&mut results, &handed);
         // One serialized group per finding group, one result per finding, in
@@ -1436,7 +1444,7 @@ fn scan_loaded(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
     let (mut visual, superseded, stalled) =
-        run_visual_contrast_fallback(page, &analyses, &serialized_groups, viewport, profile, url, pixels_off)?;
+        run_visual_contrast_fallback(page, &analyses, &serialized_groups, &collapsed_selectors, viewport, profile, url, pixels_off)?;
     if pixels_off {
         notes.push(format!(
             "Capture note: {url} was hidden (minimized, or a background tab or window), so the pixel pass read nothing there. Bring it on screen, focused or not, and scan again for those contrast verdicts."
@@ -2185,6 +2193,7 @@ fn run_visual_contrast_fallback(
     page: &mut Page<'_>,
     browser_analyses: &[Value],
     serialized_groups: &[Value],
+    collapsed_selectors: &[String],
     viewport: Viewport,
     profile: Option<&DetectorProfile>,
     target: &str,
@@ -2199,7 +2208,7 @@ fn run_visual_contrast_fallback(
         .filter_map(CandidateKey::of)
         .collect();
     let is_routed = |v: &Value| routed.iter().any(|k| k.names_value(v));
-    let existing_low_contrast: Vec<String> = serialized_groups
+    let mut existing_low_contrast: Vec<String> = serialized_groups
         .iter()
         .filter(|g| {
             g.get("findings")
@@ -2214,6 +2223,13 @@ fn run_visual_contrast_fallback(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
+    // A copy a counted finding speaks for is reported there: the analyses
+    // and the pixel reads neither report it again nor spend a slot on it.
+    for s in collapsed_selectors {
+        if !existing_low_contrast.contains(s) {
+            existing_low_contrast.push(s.clone());
+        }
+    }
 
     let (mut findings, mut superseded) =
         analysis_findings(browser_analyses, &existing_low_contrast, &routed);

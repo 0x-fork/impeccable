@@ -249,7 +249,13 @@ fn nested_cards_in_a_mockup_are_advisory() {
     // a phone-shaped shell that holds the page's h1 (fails), and r14-t7 a
     // card in a dotted window that holds code (fails).
     assert_eq!(count(&f, "nested-cards", true), 7, "{f:#?}");
-    assert_eq!(count(&f, "nested-cards", false), 10, "{f:#?}");
+    // One panel, one finding (r14-t5): the three paseo.sh cards report once,
+    // counting two more, so ten failing cards are eight findings.
+    assert_eq!(count(&f, "nested-cards", false), 8, "{f:#?}");
+    assert!(
+        f.iter().any(|x| x.antipattern == "nested-cards" && x.snippet == "Card inside card (div) (and 2 more)"),
+        "{f:#?}"
+    );
 }
 
 #[test]

@@ -1013,6 +1013,17 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
     check_stripe_child(&class_selector(el), width, edge, bg)
 }
 
+/// An opaque handle for `el`, as the colour-pair dedupe names the element
+/// that claims a pair and the copies it speaks for. A claim with this
+/// handle is always on screen: this engine has no layout, so it behaves as
+/// an unnamed claim did.
+pub fn element_handle(el: &StaticElement<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    el.id().hash(&mut h);
+    h.finish()
+}
+
 /// JS: checks.mjs#checkElementColors(el, style, tag, window, customPropMap, hasAnchorInheritRule)
 pub fn check_element_colors(
     el: &StaticElement<'_>,
@@ -1200,7 +1211,7 @@ pub fn check_element_colors(
     let mut findings = check_colors_deduped_shaped(
         &color_opts,
         seen,
-        None,
+        Some(impeccable_core::checks::rules::PairClaim { owner: element_handle(el), on_screen: true }),
         &is_decorative,
         &mut |h: &RuleHit| !scoped_ignore_active(el, &h.id) && !picture_under_text(el),
     );

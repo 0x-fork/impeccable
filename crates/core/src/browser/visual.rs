@@ -2616,6 +2616,9 @@ re!(HANDED_VERDICT_RE, r"^[0-9.]+:1 \(need ([0-9.]+):1\) — text (#[0-9a-fA-F]{
 /// printed against a layer, a verdict not in the element pass's plain form,
 /// any other layer, and unread paint the ratio is measured through.
 pub fn handed_over_unmeasured(dom: &dyn Dom, el: ElId, snippet: &str) -> bool {
+    // A verdict that speaks for other copies of its pair says so at the end.
+    let (snippet, _) = crate::checks::rules::split_more_count(snippet);
+    let snippet = snippet.as_str();
     let Some(caps) = HANDED_VERDICT_RE.captures(snippet) else {
         return false;
     };

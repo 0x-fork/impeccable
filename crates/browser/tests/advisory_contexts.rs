@@ -302,10 +302,20 @@ fn nested_cards_in_a_mockup_are_advisory() {
     ] {
         assert_eq!(on(&f, rule, id), ["advisory"], "{id}: {f:#?}");
     }
+    // One panel, one finding (r14-t5): the first of paseo.sh's three
+    // bordered cards reports and counts the other two.
+    assert!(
+        f.iter().any(|(r, s, sel, sev)| r == rule
+            && s == "Card inside card (and 2 more)"
+            && sel == "#fail-panel-a"
+            && sev == "warning"),
+        "{f:#?}"
+    );
+    for id in ["#fail-panel-b", "#fail-panel-c"] {
+        assert!(on(&f, rule, id).is_empty(), "{id}: {f:#?}");
+    }
     for id in [
         "#fail-panel-a",
-        "#fail-panel-b",
-        "#fail-panel-c",
         "#fail-two-dots-inner",
         "#fail-fanned-inner",
         "#fail-prose-panel",
