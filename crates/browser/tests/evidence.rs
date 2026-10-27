@@ -92,7 +92,14 @@ fn handle(mut stream: TcpStream) {
         "/missing" => respond(&mut stream, "404 Not Found", "", "text/html; charset=utf-8", NOT_FOUND.as_bytes()),
         _ => {
             let rel = path.trim_start_matches('/');
-            let file = fixtures_dir().join(rel);
+            // `/evidence/<file>`: fixtures outside the rule fixtures, which
+            // the oracle scans as a directory.
+            let file = match rel.strip_prefix("evidence/") {
+                Some(name) if !name.contains('/') && !name.contains("..") => {
+                    fixtures_dir().join("../evidence").join(name)
+                }
+                _ => fixtures_dir().join(rel),
+            };
             match std::fs::read(&file) {
                 Ok(body) => {
                     let ct = if rel.ends_with(".css") { "text/css" } else { "text/html; charset=utf-8" };
@@ -539,4 +546,37 @@ fn evidence_follows_the_scanned_element_after_the_page_changes() {
             assert!(a.is_null(), "{f:?}: {a}");
         }
     }
+}
+
+/// round 14: a slide that steps on between the evidence measure and the
+/// screenshot (gseek.kr, corpus run 1010) is measured again after the
+/// screenshot, and its drift records where it went (`afterShot`) beside the
+/// rect the crop was cut by. A note that stays put records nothing.
+#[test]
+fn evidence_notes_an_element_that_moved_during_the_screenshot() {
+    let Some(engine) = engine() else { return };
+    let port = serve();
+    let mut browser = engine.launch().expect("launch");
+    let url = format!("http://127.0.0.1:{port}/evidence/shot-motion.html");
+    let (findings, evidence) =
+        detect_url_evidence(&mut browser, &url, &ScanOptions::default(), "load", 100, &EvidenceRequest::default())
+            .expect("evidence scan");
+    browser.close();
+    let selector = |class: &str| -> String {
+        findings
+            .iter()
+            .filter(|f| f.antipattern == "low-contrast")
+            .filter_map(|f| f.extras.get("selector").and_then(|v| v.as_str()))
+            .find(|s| s.contains(class))
+            .unwrap_or_else(|| panic!("{class} not flagged: {findings:#?}"))
+            .to_string()
+    };
+    let step = selector("step-note");
+    let measured = evidence.element_rects[&step][0].as_f64().unwrap();
+    let drift = &evidence.element_drift[&step];
+    assert_eq!(drift["measured"][0].as_f64(), Some(measured), "{drift}");
+    assert_eq!(drift["scan"][0], drift["measured"][0], "{drift}");
+    assert!(drift["afterShot"][0].as_f64().unwrap() - measured > 260.0, "{drift}");
+    assert!(evidence.element_drift.get(&selector("still-note")).is_none(), "{:?}", evidence.element_drift);
+    assert_eq!(evidence.element_drift.len(), 1, "{:?}", evidence.element_drift);
 }
