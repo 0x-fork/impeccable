@@ -1356,13 +1356,75 @@ fn selector_list_pseudos(selector: &str) -> Vec<Option<&'static str>> {
     parts
 }
 
+/// `html` with the text inside every `<script>` element removed and the
+/// tags kept. A serialized document cannot hold `</script` inside a script,
+/// so the first one after the start tag closes it. A `<script` inside an
+/// HTML comment or a `<style>` block is not a script, and a script with no `</script` after it
+/// keeps its text: the rest of the document stays as it was.
+fn without_script_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut from = 0usize;
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find("<script") {
+        let start = search + rel;
+        // A comment or a `<style>` block before it is skipped whole: a
+        // `<script` in either is text, not a tag.
+        let comment = lower[search..start].find("<!--").map(|p| (search + p, "<!--".len(), "-->"));
+        let style = lower[search..start]
+            .match_indices("<style")
+            .map(|(p, _)| search + p)
+            .find(|&p| lower.as_bytes().get(p + 6).is_some_and(|b| b.is_ascii_whitespace() || *b == b'>'))
+            .map(|p| (p, "<style".len(), "</style"));
+        if let Some((at, open_len, close)) = [comment, style].into_iter().flatten().min_by_key(|(at, _, _)| *at) {
+            match lower[at + open_len..].find(close) {
+                Some(end) => {
+                    search = at + open_len + end + close.len();
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let after = start + "<script".len();
+        let delimited = lower
+            .as_bytes()
+            .get(after)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
+        if !delimited {
+            search = after;
+            continue;
+        }
+        let Some(open_end) = lower[after..].find('>').map(|p| after + p + 1) else {
+            break;
+        };
+        let closing = lower[open_end..].match_indices("</script").map(|(p, _)| open_end + p).find(|&p| {
+            lower
+                .as_bytes()
+                .get(p + "</script".len())
+                .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
+        });
+        let Some(close) = closing else {
+            break;
+        };
+        out.push_str(&html[from..open_end]);
+        from = close;
+        search = close + "</script".len();
+    }
+    out.push_str(&html[from..]);
+    out
+}
+
 /// [`scoped_html_pattern_findings`] keeping each finding's selector and the
 /// elements it resolves to, plus the style corpus the pass read.
 fn html_pattern_items(
     dom: &dyn Dom,
     context: &crate::checks::html_patterns::PatternContext,
 ) -> (Vec<PatternItem>, String) {
-    let html = dom.document_html_for_patterns();
+    // A script's text is not markup: a `style` attribute or a `<style>`
+    // block written inside a JS string (gseek.kr's course cards, built by a
+    // template literal) paints only once the script inserts it, and then
+    // the live DOM carries it as an element of its own.
+    let html = without_script_text(&dom.document_html_for_patterns());
     // Linked stylesheets are absent from the page's outerHTML, so the probe
     // hands their readable, live-resolving rules to the style corpus (#709).
     let mut corpora = crate::checks::html_patterns::build_html_pattern_corpora(&html);
@@ -1522,11 +1584,18 @@ fn drop_covered_palette_forms(findings: &mut Vec<BrowserFinding>) {
 /// and `body` with an opaque fill, which is what the canvas shows. `None`
 /// where that cannot be read off the root (neither paints a fill, or the
 /// fill sits under an image or a gradient), which leaves the decision to the
-/// stylesheet text.
+/// stylesheet text. A root where neither paints anything at all shows the
+/// browser's white canvas, and reads light where nothing else on the page
+/// stands in for the ground ([`unpainted_root_reads_light`]).
+///
+/// [`unpainted_root_reads_light`]: super::page_checks::unpainted_root_reads_light
 fn painted_root_is_dark(dom: &dyn Dom) -> Option<bool> {
+    let mut tinted = false;
     for el in [dom.document_element(), dom.body()].into_iter().flatten() {
         let image = dom.style(el, "backgroundImage");
-        let paints_image = !image.is_empty() && image != "none";
+        // A gradient wash too faint to change the ground (looot.ai's 8%
+        // mint corner over a white body) leaves the fill under it readable.
+        let paints_image = !image.is_empty() && image != "none" && !is_faint_gradient_wash(&image);
         match crate::color::parse_any_color(Some(&dom.style(el, "backgroundColor"))) {
             Some(fill) if fill.alpha_or_one() > 0.5 => {
                 return if paints_image {
@@ -1536,10 +1605,29 @@ fn painted_root_is_dark(dom: &dyn Dom) -> Option<bool> {
                 };
             }
             _ if paints_image => return None,
+            Some(fill) if fill.alpha_or_one() > 0.0 => tinted = true,
             _ => {}
         }
     }
+    if !tinted && dom.body().is_some() && super::page_checks::unpainted_root_reads_light(dom) {
+        return Some(false);
+    }
     None
+}
+
+/// The alpha under which every stop of a root's gradient leaves the fill
+/// beneath it as the colour a visitor reads.
+const ROOT_WASH_MAX_STOP_ALPHA: f64 = 0.1;
+
+/// Whether a `background-image` is only gradients whose colour stops all
+/// paint at [`ROOT_WASH_MAX_STOP_ALPHA`] or less. A picture, or a stop that
+/// cannot be read, is not.
+fn is_faint_gradient_wash(image: &str) -> bool {
+    if image.contains("url(") || image.contains("image-set(") || image.contains("element(") || image.contains("paint(") {
+        return false;
+    }
+    let stops = crate::color::parse_gradient_colors(Some(image));
+    !stops.is_empty() && stops.iter().all(|c| c.alpha_or_one() <= ROOT_WASH_MAX_STOP_ALPHA)
 }
 
 /// Whether a resolved surface is light (the dark-background forms' threshold).
@@ -1609,7 +1697,18 @@ fn reconcile_page_level_forms(
             _ => true,
         };
         if stands {
-            out.push(item.finding);
+            let mut finding = item.finding;
+            // A dark claim that stands on a light root stands on the dark
+            // surfaces under its elements (looot.ai's halo in a dark card on
+            // a mint-washed white page), which is the element form's wording.
+            if root_dark == Some(false)
+                && matches!(finding.type_.as_str(), "dark-glow" | "radial-halo")
+            {
+                if let Some(head) = finding.detail.strip_suffix("on dark page") {
+                    finding.detail = format!("{head}on dark background");
+                }
+            }
+            out.push(finding);
         }
     }
     out
@@ -2044,7 +2143,24 @@ fn marquee_page_form_stands(
     // A marquee is content crawling past: words, logos, pictures. A loop that
     // moves nothing a visitor reads or looks at (a wave drawn as one SVG
     // path, a highlight sweeping across a pill) is an ornament in motion.
-    if !elements.iter().any(|&el| marquee_carries_content(dom, el)) {
+    // A loop declared on a pseudo-element moves that pseudo-element, not its
+    // host: a `content: ""` gradient sweeping across a banner with text in
+    // it (zcad.ai's `.home-announcement::before`, mypip.dev's
+    // `.feature-asset-stack::after`) carries nothing, whatever the host
+    // holds. A selector list that also names a host reads the hosts.
+    // Each part of a list asks its own pseudo-element of its own hosts.
+    let pseudos = item.selector.as_deref().map(selector_list_pseudos).unwrap_or_default();
+    let carries = if !pseudos.is_empty() && pseudos.iter().all(Option::is_some) {
+        match item.selector.as_deref().and_then(|s| pseudo_parts_carry_content(dom, s, elements)) {
+            Some(carries) => carries,
+            None => elements
+                .iter()
+                .any(|&el| pseudos.iter().flatten().any(|which| pseudo_carries_content(dom, el, which))),
+        }
+    } else {
+        elements.iter().any(|&el| marquee_carries_content(dom, el))
+    };
+    if !carries {
         return false;
     }
     let root_like = |el: ElId| Some(el) == dom.body() || Some(el) == dom.document_element();
@@ -2110,12 +2226,36 @@ fn marquee_carries_content(dom: &dyn Dom, el: ElId) -> bool {
     if paints_image(el) || dom.query_all(Some(el), "*").unwrap_or_default().into_iter().any(paints_image) {
         return true;
     }
-    ["::before", "::after"].iter().any(|which| {
-        dom.pseudo_style(el, which, "content").map_or(false, |c| {
-            let c = crate::js::trim(&c).to_string();
-            !(c.is_empty() || c == "none" || c == "normal" || c == "\"\"" || c == "''")
-                || dom.pseudo_style(el, which, "backgroundImage").map_or(false, |b| b.contains("url("))
-        })
+    ["::before", "::after"].iter().any(|which| pseudo_carries_content(dom, el, which))
+}
+
+/// For a selector list whose every part names a `::before` or `::after`,
+/// whether any part's own pseudo-element carries content on that part's own
+/// hosts (among `elements`). `None` where a part cannot be split off or
+/// resolved, and the caller reads every pseudo-element on every host.
+fn pseudo_parts_carry_content(dom: &dyn Dom, selector: &str, elements: &[ElId]) -> Option<bool> {
+    let parts = crate::color::split_top_level_commas(selector);
+    let mut any = false;
+    for part in &parts {
+        let which = (*selector_list_pseudos(part).first()?)?;
+        let host = pseudo_element_host_selector(part)?;
+        let hosts = selector_nodes_for_live_dom(dom, &host)?;
+        any |= hosts
+            .iter()
+            .filter(|h| elements.contains(h))
+            .any(|&h| pseudo_carries_content(dom, h, which));
+    }
+    Some(any)
+}
+
+/// Whether `el`'s `::before` or `::after` (`which`) generates something to
+/// read or look at: a string that is not empty, an image (`content: url()`
+/// is not empty either), or a `url()` background.
+fn pseudo_carries_content(dom: &dyn Dom, el: ElId, which: &str) -> bool {
+    dom.pseudo_style(el, which, "content").map_or(false, |c| {
+        let c = crate::js::trim(&c).to_string();
+        !(c.is_empty() || c == "none" || c == "normal" || c == "\"\"" || c == "''")
+            || dom.pseudo_style(el, which, "backgroundImage").map_or(false, |b| b.contains("url("))
     })
 }
 
@@ -4924,6 +5064,173 @@ mod page_level_form_tests {
         assert_eq!(painted_root_is_dark(&d), None);
     }
 
+    /// observations-1010 row 4 (gseek.kr 10139033): a white portal whose
+    /// `html` and `body` paint nothing shows the browser's white canvas, so a
+    /// dark box elsewhere in the stylesheet does not make it a dark page.
+    /// Where something else paints the ground (a dark in-flow root, a dark
+    /// fixed layer, a dark `color-scheme`), the stylesheet decides as before.
+    #[test]
+    fn an_unpainted_root_is_the_white_canvas_unless_something_paints_the_ground() {
+        let style = ".player{background-color:#000}@keyframes lift{50%{box-shadow:0 8px 24px rgba(99,102,241,.6)}}";
+        let on_dark = "Colored box-shadow glow (#6366f1) on dark page".to_string();
+        let laid_out = || -> (FakeDom, ElId, ElId) {
+            let (mut d, body) = page(style);
+            let html = d.document_element.unwrap();
+            d.set_rect(html, 0.0, 0.0, 1280.0, 2400.0);
+            d.set_rect(body, 0.0, 0.0, 1280.0, 2400.0);
+            let main = d.add(Some(body), "main");
+            d.set_rect(main, 0.0, 0.0, 1280.0, 2100.0);
+            let copy = d.add(Some(main), "p");
+            d.set_rect(copy, 32.0, 32.0, 640.0, 48.0);
+            d.add_text(copy, "Pick a course to see its outline and enrol.");
+            d.set_style(copy, "color", "rgb(17, 17, 17)");
+            let footer = d.add(Some(body), "footer");
+            d.set_rect(footer, 0.0, 2100.0, 1280.0, 300.0);
+            d.set_style(footer, "backgroundColor", "rgb(34, 34, 34)");
+            (d, body, main)
+        };
+
+        // A white page with a dark footer: light.
+        let (d, _body, _) = laid_out();
+        assert_eq!(painted_root_is_dark(&d), Some(false));
+        assert!(details(&scan(&d), "dark-glow").is_empty());
+
+        // Should-flag twin: the same page whose in-flow root paints it dark.
+        let (mut d, body, main) = laid_out();
+        d.set_style(main, "backgroundColor", "rgb(10, 10, 10)");
+        assert_eq!(painted_root_is_dark(&d), None);
+        assert_eq!(details(&scan(&d), "dark-glow"), vec![(body, on_dark.clone())]);
+
+        // A dark wash fixed behind the content (`fixed inset-0 -z-10`).
+        let (mut d, body, _) = laid_out();
+        let wash = d.add(Some(body), "div");
+        d.set_rect(wash, 0.0, 0.0, 1280.0, 800.0);
+        d.set_styles(wash, &[("position", "fixed"), ("backgroundColor", "rgb(5, 5, 8)")]);
+        assert_eq!(painted_root_is_dark(&d), None);
+        assert_eq!(details(&scan(&d), "dark-glow"), vec![(body, on_dark.clone())]);
+
+        // A root that asks for a dark colour scheme.
+        let (mut d, body, _) = laid_out();
+        let html = d.document_element.unwrap();
+        d.set_style(html, "colorScheme", "dark");
+        assert_eq!(painted_root_is_dark(&d), None);
+        assert_eq!(details(&scan(&d), "dark-glow"), vec![(body, on_dark)]);
+
+        // Review of round 14: grounds the first walk did not see.
+        // SvelteKit's `display: contents` root around a dark app box.
+        let (mut d, body, main) = laid_out();
+        let contents = d.add(Some(body), "div");
+        d.set_style(contents, "display", "contents");
+        d.set_rect(contents, 0.0, 0.0, 0.0, 0.0);
+        let app = d.add(Some(contents), "div");
+        d.set_rect(app, 0.0, 0.0, 1280.0, 2400.0);
+        d.set_style(app, "backgroundColor", "rgb(10, 10, 10)");
+        let _ = main;
+        assert_eq!(painted_root_is_dark(&d), None, "display: contents");
+        // A dark main four transparent wrappers down.
+        let (mut d, body, _) = laid_out();
+        let mut parent = body;
+        for _ in 0..3 {
+            let wrap = d.add(Some(parent), "div");
+            d.set_rect(wrap, 0.0, 0.0, 1280.0, 2400.0);
+            parent = wrap;
+        }
+        let deep = d.add(Some(parent), "main");
+        d.set_rect(deep, 0.0, 0.0, 1280.0, 2400.0);
+        d.set_style(deep, "backgroundColor", "rgb(10, 10, 10)");
+        assert_eq!(painted_root_is_dark(&d), None, "four levels down");
+        // `body::before { position: fixed; inset: 0; background: #0a0a0a }`.
+        let (mut d, body, _) = laid_out();
+        d.set_pseudo_style(body, "::before", "content", "\"\"");
+        d.set_pseudo_style(body, "::before", "backgroundColor", "rgb(10, 10, 10)");
+        assert_eq!(painted_root_is_dark(&d), None, "body::before");
+        // `<meta name="color-scheme" content="dark">`.
+        let (mut d, _body, _) = laid_out();
+        let html = d.document_element.unwrap();
+        let head = d.add(Some(html), "head");
+        let meta = d.add(Some(head), "meta");
+        d.set_attr(meta, "name", "color-scheme");
+        d.set_attr(meta, "content", "dark light");
+        assert_eq!(painted_root_is_dark(&d), None, "meta color-scheme");
+        // A fixed canvas drawn dark behind the page.
+        let (mut d, body, _) = laid_out();
+        let canvas = d.add(Some(body), "canvas");
+        d.set_rect(canvas, 0.0, 0.0, 1280.0, 800.0);
+        d.set_style(canvas, "position", "fixed");
+        assert_eq!(painted_root_is_dark(&d), None, "fixed canvas");
+        // Light text: the ground is painted somewhere the walks cannot see.
+        let (mut d, _body, main) = laid_out();
+        let copy = d.children(main)[0];
+        d.set_style(copy, "color", "rgb(245, 245, 245)");
+        assert_eq!(painted_root_is_dark(&d), None, "light text");
+
+        // A translucent tint on the body is not read as the white canvas.
+        let (mut d, body, _) = laid_out();
+        d.set_style(body, "backgroundColor", "rgba(0, 0, 0, 0.4)");
+        assert_eq!(painted_root_is_dark(&d), None);
+
+        // looot.ai: a white body under an 8% gradient wash reads as white;
+        // a picture over it does not.
+        let (mut d, body, _) = laid_out();
+        d.set_styles(
+            body,
+            &[
+                ("backgroundColor", "rgb(255, 255, 255)"),
+                ("backgroundImage", "radial-gradient(circle at 80% -20%, rgba(16, 120, 80, 0.08), rgba(0, 0, 0, 0) 35%)"),
+            ],
+        );
+        assert_eq!(painted_root_is_dark(&d), Some(false));
+        d.set_style(body, "backgroundImage", "radial-gradient(circle, rgba(16, 120, 80, 0.6), rgba(0, 0, 0, 0) 35%)");
+        assert_eq!(painted_root_is_dark(&d), None);
+    }
+
+    /// observations-1010 row 4 (gseek.kr): course cards a template literal
+    /// builds carry `style` attributes inside an inline `<script>`; neither
+    /// the glow nor the `background: #000` there is on the page.
+    #[test]
+    fn a_style_written_inside_a_script_is_not_on_the_page() {
+        assert_eq!(
+            without_script_text("<p>a</p><script>var s='<b style=\"x\">';</script><script src=\"a.js\"></script><scripts>k</scripts>"),
+            "<p>a</p><script></script><script src=\"a.js\"></script><scripts>k</scripts>"
+        );
+        assert_eq!(without_script_text("<SCRIPT type=\"module\">x</SCRIPT>y"), "<SCRIPT type=\"module\"></SCRIPT>y");
+        // Fail safe: a script never closed keeps its text, and a `<script`
+        // in a comment is not one, so the markup after it stays.
+        assert_eq!(without_script_text("a<script>never closed <i style=a>"), "a<script>never closed <i style=a>");
+        assert_eq!(
+            without_script_text("<!-- TODO: add <script> here --><style>.a{}</style><script>x</script><b style=\"c\">"),
+            "<!-- TODO: add <script> here --><style>.a{}</style><script></script><b style=\"c\">"
+        );
+        assert_eq!(without_script_text("<!-- <script --> <i style=a>"), "<!-- <script --> <i style=a>");
+        assert_eq!(without_script_text("<!-- unclosed <script>x</script>"), "<!-- unclosed <script>x</script>");
+        assert_eq!(
+            without_script_text("<script>var t = '</script-loader><div style=\"a\">';</script><b>"),
+            "<script></script><b>"
+        );
+        assert_eq!(
+            without_script_text("<style>.a::after{content:\"<script>\"}</style><b style=\"c\"><script>x</script>"),
+            "<style>.a::after{content:\"<script>\"}</style><b style=\"c\"><script></script>"
+        );
+
+        let card = "<button style=\"box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4)\">Go</button><div style=\"background: #000\"></div>";
+        let build = |markup: String| {
+            let mut d = FakeDom::new();
+            let (_html, body) = d.with_page();
+            d.html_for_patterns = format!("<html><head></head><body>{markup}</body></html>");
+            (d, body)
+        };
+        let (d, _) = build(format!("<script>var html = '{card}';</script>"));
+        assert!(details(&scan(&d), "dark-glow").is_empty());
+
+        // Should-flag twin: the same markup in the document on a dark body.
+        let (mut d, body) = build(card.to_string());
+        d.set_style(body, "backgroundColor", "rgb(10, 10, 10)");
+        assert_eq!(
+            details(&scan(&d), "dark-glow"),
+            vec![(body, "Colored box-shadow glow (#667eea) on dark page".to_string())]
+        );
+    }
+
     #[test]
     fn radial_halo_needs_a_dark_page_and_a_dark_surface() {
         let halo = ".hero{background:radial-gradient(circle at 50% 0%,#8fd8f2 0%,transparent 70%)}";
@@ -4956,7 +5263,9 @@ mod page_level_form_tests {
         d.set_rect(hero, 0.0, 0.0, 1280.0, 600.0);
         assert_eq!(details(&scan(&d), "radial-halo"), vec![(body, reported.clone())]);
 
-        // Light root, but the halo sits in a near-black band: a dark surface.
+        // Light root, but the halo sits in a near-black band: a dark
+        // surface, named as the element form names one (observations-1010
+        // row 4, looot.ai).
         let (mut d, body) = page(&format!(".band{{background:#040406}}{halo}"));
         d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
         let band = d.add(Some(body), "footer");
@@ -4965,7 +5274,8 @@ mod page_level_form_tests {
         let hero = d.add(Some(band), "div");
         d.add_selector(hero, ".hero");
         d.set_rect(hero, 1093.0, 8.0, 142.0, 142.0);
-        assert_eq!(details(&scan(&d), "radial-halo"), vec![(body, reported)]);
+        let on_surface = reported.replace("on dark page", "on dark background");
+        assert_eq!(details(&scan(&d), "radial-halo"), vec![(body, on_surface)]);
     }
 
     /// round 9 (nemonix.app, emotionalcomputing.co.uk): a halo declared
@@ -5067,7 +5377,8 @@ mod page_level_form_tests {
 
     #[test]
     fn a_halo_with_no_rule_reads_the_elements_that_paint_it() {
-        let reported = "radial-gradient halo (#211dff → transparent) on dark page".to_string();
+        // The root is light, so the claim stands on the band's surface.
+        let reported = "radial-gradient halo (#211dff → transparent) on dark background".to_string();
         let build = |band_fill: &str| {
             let mut d = FakeDom::new();
             let (_html, body) = d.with_page();
@@ -5116,7 +5427,7 @@ mod page_level_form_tests {
         let (d, body) = build("rgb(0, 0, 0)");
         assert_eq!(
             details(&scan(&d), "radial-halo"),
-            vec![(body, "radial-gradient halo (#012d2a → transparent) on dark page".to_string())]
+            vec![(body, "radial-gradient halo (#012d2a → transparent) on dark background".to_string())]
         );
     }
 
@@ -5229,6 +5540,52 @@ mod page_level_form_tests {
                 "{content}"
             );
         }
+    }
+
+    /// observations-1010 row 5 (zcad.ai 10137152, mypip.dev 10138126): a
+    /// loop declared on a pseudo-element moves the pseudo-element. A
+    /// `content: ""` gradient sheen panning across a banner with text in it
+    /// carries nothing; a pseudo-element that generates the words is a
+    /// ticker.
+    #[test]
+    fn a_pseudo_element_marquee_is_read_off_the_pseudo_element() {
+        let build = |content: &str| {
+            let style = ".ann::before{content:\"\";position:absolute;inset:0;animation:flow 6s linear infinite}\
+.ticker::before{content:\"SALE • NEW • \";animation:flow 20s linear infinite}\
+@keyframes flow{0%{transform:translateX(-48%)}100%{transform:translateX(48%)}}";
+            let (mut d, body) = page(style);
+            let banner = d.add(Some(body), "aside");
+            d.add_selector(banner, ".ann");
+            d.add_selector(banner, ".ticker");
+            d.add_text(banner, "New: the spring release is out");
+            d.set_pseudo_style(banner, "::before", "content", content);
+            d.set_pseudo_style(banner, "::before", "animationName", "flow");
+            d
+        };
+        let d = build("\"\"");
+        assert!(details(&scan(&d), "marquee").is_empty());
+        let d = build("\"SALE • NEW • \"");
+        assert!(!details(&scan(&d), "marquee").is_empty());
+
+        // A list asks each part's own pseudo-element: two empty sheens on
+        // `::before` and `::after` of different hosts carry nothing, though
+        // the second host's still `::before` holds words.
+        let style = ".a::before, .b::after{content:\"\";animation:flow 6s linear infinite}\
+@keyframes flow{0%{transform:translateX(-48%)}100%{transform:translateX(48%)}}";
+        let (mut d, body) = page(style);
+        let a = d.add(Some(body), "div");
+        d.add_selector(a, ".a");
+        d.set_pseudo_style(a, "::before", "content", "\"\"");
+        d.set_pseudo_style(a, "::before", "animationName", "flow");
+        let b = d.add(Some(body), "div");
+        d.add_selector(b, ".b");
+        d.set_pseudo_style(b, "::after", "content", "\"\"");
+        d.set_pseudo_style(b, "::after", "animationName", "flow");
+        d.set_pseudo_style(b, "::before", "content", "\"New\"");
+        assert!(details(&scan(&d), "marquee").is_empty());
+        // The twin: the moving `::after` itself generates words.
+        d.set_pseudo_style(b, "::after", "content", "\"Ticker words\"");
+        assert!(!details(&scan(&d), "marquee").is_empty());
     }
 
     /// freenet.de: `.md-header::after` drew one 3px stripe and it reported

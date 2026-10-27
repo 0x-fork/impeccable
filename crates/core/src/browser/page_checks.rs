@@ -197,6 +197,40 @@ fn font_text_has_a_box(dom: &dyn Dom, el: ElId) -> bool {
     true
 }
 
+/// Faces on [`OVERUSED_FONTS`] that an operating system ships, so a page
+/// can name them and get them with no `@font-face` at all.
+pub const OVERUSED_SYSTEM_FACES: &[&str] = &["arial", "helvetica", "roboto"];
+
+/// Whether the browser shows that `font` (an [`OVERUSED_FONTS`] entry) is
+/// not what the page's text is set in (taste call r12-t2; looot.ai and
+/// felixowolf.com name Inter in a stack nothing supplies, and the text
+/// renders in a fallback). It takes all of: `font` is not a face an
+/// operating system ships ([`OVERUSED_SYSTEM_FACES`]); the capture measured
+/// the faces its text asks for and found `font` not drawn at all, from the
+/// system or from the page ([`Dom::rendered_faces`]); and the capture listed
+/// `document.fonts` with no face of that family at any status but `error`.
+/// A face installed on the capture machine is drawn and keeps the finding;
+/// so does a webfont still `loading` or listed `unloaded`, a family the
+/// measurement did not reach, and a capture that recorded neither list. The
+/// static engine has no browser to ask and keeps reporting.
+fn face_never_loaded(dom: &dyn Dom, font: &str) -> bool {
+    if OVERUSED_SYSTEM_FACES.contains(&font) {
+        return false;
+    }
+    let names_font = |family: &str| {
+        let family = js::to_lower_case(&strip_edge_quotes(js::trim(family)));
+        overused_font_name(&family) == Some(font) || family == font
+    };
+    let (Some(faces), Some(rendered)) = (dom.document_font_faces(), dom.rendered_faces()) else {
+        return false;
+    };
+    let measured: Vec<bool> = rendered.iter().filter(|(f, _)| names_font(f)).map(|(_, drawn)| *drawn).collect();
+    if measured.is_empty() || measured.iter().any(|drawn| *drawn) {
+        return false;
+    }
+    !faces.iter().any(|(family, status)| names_font(family) && status != "error")
+}
+
 const IMPECCABLE_OWN: &str =
     ".impeccable-overlay, .impeccable-label, .impeccable-banner, .impeccable-tooltip";
 
@@ -289,6 +323,7 @@ pub fn check_typography(dom: &dyn Dom) -> Vec<BrowserFinding> {
                     && !is_brand_font_on_own_domain(font, Some(&hostname))
                     && !sets_next_to_none_of_the_text(font, &font_chars, total_text_chars)
                     && !latin_face_on_a_cjk_page(font, &letter_tally)
+                    && !face_never_loaded(dom, font)
                 {
                     findings.push(BrowserFinding::new(
                         "overused-font",
@@ -2725,6 +2760,198 @@ fn covering_ground(dom: &dyn Dom, body: ElId) -> Option<crate::color::Rgba> {
         _ => Some((c, h)),
     })
     .map(|(c, _)| c)
+}
+
+/// The share of the page's height that dark or pictured full-width bands
+/// may cover under an unpainted root before the white canvas stops being
+/// the page's ground.
+const UNPAINTED_ROOT_DARK_BAND_MAX_SHARE: f64 = 0.5;
+
+/// The share of the viewport, on each axis, an out-of-flow layer has to
+/// cover to stand in for the page's ground (a `fixed inset-0 -z-10` wash).
+const GROUND_LAYER_MIN_VIEWPORT_SHARE: f64 = 0.9;
+
+/// How many levels of boxes with a height of their own the in-flow walk of
+/// [`unpainted_root_reads_light`] looks through (`body > #__next > .l1 >
+/// .l2 > main` is four). Wrappers with no box (`display: contents`) or no
+/// height do not count.
+const UNPAINTED_ROOT_WALK_MAX_DEPTH: usize = 8;
+
+/// How many boxes the in-flow walk visits before it gives up and leaves
+/// the decision to the stylesheet.
+const UNPAINTED_ROOT_WALK_MAX_BOXES: usize = 4000;
+
+/// Text at or above this relative luminance is light: it could not be read
+/// on the white canvas, so a page that sets most of its text this way has
+/// painted its ground somewhere.
+const LIGHT_TEXT_MIN_LUMINANCE: f64 = 0.4;
+
+/// Whether a page whose `html` and `body` paint neither a fill nor an image
+/// shows the browser's white canvas as its ground (observations-1010 row 4,
+/// gseek.kr: a white portal with a `#222` footer, read as a dark page off a
+/// `background: #000` in its stylesheet). False, so the stylesheet decides
+/// as before, wherever something else may paint the ground or the reading
+/// is unsure:
+///
+/// - the root or body computes a dark `color-scheme`, or a `<meta
+///   name="color-scheme">` asks for `dark`;
+/// - a `::before` or `::after` of `html` or `body` paints a fill or an
+///   image;
+/// - a layer out of flow covers the viewport and paints a fill, an image,
+///   or a picture by its tag (`canvas`, `video`, `img`, `iframe`);
+/// - in-flow boxes as wide as the body that paint a dark fill, a picture
+///   or a gradient cover half the page's height or more, looked for through
+///   transparent boxes [`UNPAINTED_ROOT_WALK_MAX_DEPTH`] levels down and
+///   through wrappers with no box or no height at no cost;
+/// - most of the page's visible text is light, or the page sets none.
+pub(crate) fn unpainted_root_reads_light(dom: &dyn Dom) -> bool {
+    let Some(body) = dom.body() else { return false };
+    let root = dom.document_element();
+    let roots: Vec<ElId> = [root, Some(body)].into_iter().flatten().collect();
+    if roots
+        .iter()
+        .any(|&el| js::to_lower_case(&dom.style(el, "colorScheme")).contains("dark"))
+    {
+        return false;
+    }
+    let meta_asks_dark = dom.query_all(None, "meta").unwrap_or_default().into_iter().any(|m| {
+        dom.attr(m, "name").is_some_and(|n| js::trim(&n).eq_ignore_ascii_case("color-scheme"))
+            && dom.attr(m, "content").is_some_and(|c| js::to_lower_case(&c).contains("dark"))
+    });
+    if meta_asks_dark {
+        return false;
+    }
+    let paints_picture = |el: ElId| {
+        let image = dom.style(el, "backgroundImage");
+        !image.is_empty() && image != "none"
+    };
+    let pseudo_paints = roots.iter().any(|&el| {
+        ["::before", "::after"].iter().any(|which| {
+            let content = dom.pseudo_style(el, which, "content").unwrap_or_default();
+            let content = js::trim(&content);
+            if content.is_empty() || content == "none" || content == "normal" {
+                return false;
+            }
+            let fill = parse_any_color(dom.pseudo_style(el, which, "backgroundColor").as_deref())
+                .is_some_and(|f| f.alpha_or_one() > 0.0);
+            let image = dom
+                .pseudo_style(el, which, "backgroundImage")
+                .is_some_and(|i| !i.is_empty() && i != "none");
+            fill || image
+        })
+    });
+    if pseudo_paints {
+        return false;
+    }
+    let dark_fill = |el: ElId| {
+        super::background::read_own_background_color(dom, el)
+            .is_some_and(|f| f.alpha_or_one() > 0.5 && crate::color::relative_luminance(&f) < 0.1)
+    };
+    let (vw, vh) = (dom.inner_width(), dom.inner_height());
+    if !(vw > 0.0 && vh > 0.0) {
+        return false;
+    }
+    let all = dom.query_all(None, "*").unwrap_or_default();
+    for &el in &all {
+        if !matches!(dom.style(el, "position").as_str(), "fixed" | "absolute") {
+            continue;
+        }
+        let r = dom.rect(el);
+        if !r.all_finite()
+            || r.width < GROUND_LAYER_MIN_VIEWPORT_SHARE * vw
+            || r.height < GROUND_LAYER_MIN_VIEWPORT_SHARE * vh
+        {
+            continue;
+        }
+        let fill = super::background::read_own_background_color(dom, el).is_some_and(|f| f.alpha_or_one() > 0.5);
+        let picture_tag = matches!(tag_lower(dom, el).as_str(), "canvas" | "video" | "img" | "iframe");
+        if (fill || picture_tag || paints_picture(el)) && painted_at_capture(dom, el) {
+            return false;
+        }
+    }
+    let body_rect = dom.rect(body);
+    if !body_rect.all_finite() || body_rect.width <= 0.0 {
+        return false;
+    }
+    let sy = finite_or_zero(dom.scroll_y());
+    let page_bottom = root
+        .map(|r| dom.scroll_height(r))
+        .filter(|h| h.is_finite())
+        .unwrap_or(0.0)
+        .max(body_rect.bottom + sy);
+    let start = (body_rect.top + sy).max(0.0);
+    if page_bottom <= start {
+        return false;
+    }
+    let mut dark: Vec<(f64, f64)> = Vec::new();
+    let mut stack: Vec<(ElId, usize)> = vec![(body, 0)];
+    let mut visited = 0usize;
+    while let Some((el, depth)) = stack.pop() {
+        for child in dom.children(el) {
+            visited += 1;
+            if visited > UNPAINTED_ROOT_WALK_MAX_BOXES {
+                return false;
+            }
+            if !matches!(dom.style(child, "position").as_str(), "static" | "relative" | "sticky" | "") {
+                continue;
+            }
+            let transparent =
+                super::background::read_own_background_color(dom, child).map_or(true, |f| f.alpha_or_one() <= 0.0);
+            let r = dom.rect(child);
+            // A wrapper with no box or no height of its own (SvelteKit's
+            // `display: contents` root) holds the page's boxes without
+            // taking a level.
+            if dom.style(child, "display") == "contents" || (r.all_finite() && r.height <= 0.0 && transparent) {
+                stack.push((child, depth));
+                continue;
+            }
+            let over_body = r.right.min(body_rect.right) - r.left.max(body_rect.left);
+            if !r.all_finite() || r.height <= 0.0 || over_body < GROUND_COVER_MIN_SHARE * body_rect.width {
+                continue;
+            }
+            if !painted_at_capture(dom, child) {
+                continue;
+            }
+            if dark_fill(child) || paints_picture(child) {
+                dark.push(((r.top + sy).max(start), (r.bottom + sy).min(page_bottom)));
+            } else if depth + 1 < UNPAINTED_ROOT_WALK_MAX_DEPTH && transparent {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    dark.retain(|(t, b)| b > t);
+    dark.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut covered, mut reach) = (0.0, start);
+    for (t, b) in dark {
+        if b > reach {
+            covered += b - t.max(reach);
+            reach = b;
+        }
+    }
+    if covered >= UNPAINTED_ROOT_DARK_BAND_MAX_SHARE * (page_bottom - start) {
+        return false;
+    }
+    // A backstop for ground the walks above cannot see (a canvas drawn
+    // dark, an inset shadow): light text is unreadable on the white canvas,
+    // so a page that sets most of its characters light has a dark ground.
+    let (mut light, mut darkish) = (0.0f64, 0.0f64);
+    for &el in &all {
+        let chars = direct_text_chars(dom, el);
+        if chars <= 0.0 || !font_text_has_a_box(dom, el) {
+            continue;
+        }
+        match parse_any_color(Some(&dom.style(el, "color"))) {
+            Some(c) if c.alpha_or_one() > 0.0 => {
+                if crate::color::relative_luminance(&c) >= LIGHT_TEXT_MIN_LUMINANCE {
+                    light += chars;
+                } else {
+                    darkish += chars;
+                }
+            }
+            _ => {}
+        }
+    }
+    darkish > light
 }
 
 /// Whether a painted in-flow box as wide as the body, up to
@@ -5541,6 +5768,62 @@ mod tests {
             typeset(&mut d, body, "p", "Copy", "\"Inter Tight\", sans-serif");
         }
         assert_eq!(font_finding(&d), None);
+    }
+
+    /// Taste call r12-t2 (looot.ai run 1010, felixowolf.com run 1006): a
+    /// page that names Inter in a stack nothing supplies sets its text in a
+    /// fallback. Where the capture listed `document.fonts` and no face of
+    /// the family is loaded, loading or waiting, the finding stands down.
+    /// A loaded subset, a face still on its way, a system face and a
+    /// capture that did not list the faces keep it.
+    #[test]
+    fn a_face_the_browser_never_loaded_is_not_the_page_face() {
+        let build = |faces: Option<Vec<(&str, &str)>>, family: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            for _ in 0..20 {
+                typeset(&mut d, body, "p", "Copy set in the named face", family);
+            }
+            d.font_faces = faces.map(|f| f.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect());
+            // The canvas finds the named face not drawn.
+            let face = family.split(',').next().unwrap().trim().trim_matches('"').to_string();
+            d.rendered_faces = Some(vec![(face, false)]);
+            d
+        };
+        let inter = "Inter, sans-serif";
+        let reported = Some("Primary font: inter (100% of text)".to_string());
+        // Never declared, or declared and failed.
+        assert_eq!(font_finding(&build(Some(vec![]), inter)), None);
+        assert_eq!(font_finding(&build(Some(vec![("Noto Sans", "loaded")]), inter)), None);
+        assert_eq!(font_finding(&build(Some(vec![("Inter", "error")]), inter)), None);
+        // Should-flag twins.
+        assert_eq!(font_finding(&build(None, inter)), reported);
+        assert_eq!(font_finding(&build(Some(vec![("Inter", "loaded")]), inter)), reported);
+        assert_eq!(font_finding(&build(Some(vec![("\"Inter\"", "loaded")]), inter)), reported);
+        assert_eq!(font_finding(&build(Some(vec![("Inter", "error"), ("Inter", "loaded")]), inter)), reported);
+        assert_eq!(font_finding(&build(Some(vec![("Inter", "loading")]), inter)), reported);
+        assert_eq!(font_finding(&build(Some(vec![("Inter", "unloaded")]), inter)), reported);
+        assert_eq!(
+            font_finding(&build(Some(vec![]), "Arial, sans-serif")),
+            Some("Primary font: arial (100% of text)".to_string())
+        );
+        // A face installed on the capture machine is drawn and keeps the
+        // finding with no `@font-face`, and so does a capture that did not
+        // measure.
+        let mut installed = build(Some(vec![]), inter);
+        installed.rendered_faces = Some(vec![("Inter".to_string(), true)]);
+        assert_eq!(font_finding(&installed), reported);
+        let mut unmeasured = build(Some(vec![]), inter);
+        unmeasured.rendered_faces = None;
+        assert_eq!(font_finding(&unmeasured), reported);
+        let mut other = build(Some(vec![]), inter);
+        other.rendered_faces = Some(vec![("Lora".to_string(), false)]);
+        assert_eq!(font_finding(&other), reported);
+        // One face under another spelling (`GeistSans` from the package).
+        assert_eq!(
+            font_finding(&build(Some(vec![("GeistSans", "loaded")]), "\"Geist Sans\", sans-serif")),
+            Some("Primary font: geist sans (100% of text)".to_string())
+        );
     }
 
     /// walla.co.il: Arial is "40% of text" by element and sets 2% of the

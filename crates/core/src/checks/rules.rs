@@ -307,6 +307,29 @@ pub fn tailwind_declared_corners(scope: &str) -> DeclaredCorners {
     declared
 }
 
+/// How far apart a circle's width and height may be: a ring drawn at 64px
+/// by 62px is still a ring.
+pub const CIRCLE_MAX_ASPECT: f64 = 1.1;
+
+/// Whether the box is a circle: width and height within
+/// [`CIRCLE_MAX_ASPECT`] of each other, and every corner rounded to at least
+/// half the shorter side. A border on one side of a circle is an arc (a
+/// spinner, an orbit ring around an icon, observations-1010 row 6), not a
+/// stripe on a card. A box whose size or corners the caller could not read
+/// is not a circle.
+fn is_circle(opts: &BorderOpts) -> bool {
+    let (Some([w, h]), Some(c)) = (opts.box_size, opts.corners.as_ref()) else {
+        return false;
+    };
+    if !(w > 0.0 && h > 0.0) || w.max(h) > w.min(h) * CIRCLE_MAX_ASPECT {
+        return false;
+    }
+    let half = w.min(h) / 2.0;
+    [c.top_left, c.top_right, c.bottom_right, c.bottom_left]
+        .iter()
+        .all(|&r| r >= half - 0.5)
+}
+
 /// JS: checks.mjs#checkBorders
 pub fn check_borders(
     tag: &str,
@@ -320,6 +343,9 @@ pub fn check_borders(
         return Vec::new();
     }
     if opts.status_context {
+        return Vec::new();
+    }
+    if is_circle(opts) {
         return Vec::new();
     }
     let mut findings = Vec::new();
@@ -2515,6 +2541,39 @@ mod tests {
     fn rgb(r: f64, g: f64, b: f64) -> Rgba {
         Rgba::new(r, g, b, 1.0)
     }
+
+    /// observations-1010 row 6 (mypip.dev 10137997, 10137996): a border on
+    /// one side of a circle is an arc of a ring (an orbit around an icon, a
+    /// spinner), not a stripe on a card. A card keeps reporting, and so does
+    /// a box whose size nobody read.
+    #[test]
+    fn a_border_arc_on_a_circle_is_not_an_accent() {
+        let ring = |w: f64, h: f64, radius: f64| BorderOpts {
+            corners: Some(Corners { top_left: radius, top_right: radius, bottom_right: radius, bottom_left: radius }),
+            box_size: Some([w, h]),
+            ..Default::default()
+        };
+        let teal = Some("rgb(45, 212, 191)");
+        let none = Some("rgba(0, 0, 0, 0)");
+        let right = Sides { top: 0.0, right: 2.0, bottom: 0.0, left: 0.0 };
+        let top = Sides { top: 2.0, right: 0.0, bottom: 0.0, left: 0.0 };
+        let colors = Sides { top: teal, right: teal, bottom: none, left: none };
+        assert!(check_borders("div", &right, &colors, 9999.0, &ring(64.0, 64.0, 9999.0)).is_empty());
+        assert!(check_borders("div", &top, &colors, 9999.0, &ring(80.0, 80.0, 9999.0)).is_empty());
+        // `rounded-full` resolved to half the side, and a ring a pixel off square.
+        assert!(check_borders("div", &right, &colors, 32.0, &ring(64.0, 62.0, 32.0)).is_empty());
+        // Should-flag twins: a `rounded-xl border-l-4` card, a pill, and a
+        // ring whose size was not read.
+        let left = Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 4.0 };
+        let card = check_borders("div", &left, &Sides { left: teal, ..colors }, 12.0, &ring(320.0, 180.0, 12.0));
+        assert_eq!(card.len(), 1, "{card:?}");
+        assert_eq!(card[0].id, "side-tab");
+        let pill = check_borders("div", &right, &colors, 9999.0, &ring(160.0, 40.0, 9999.0));
+        assert_eq!(pill.len(), 1, "{pill:?}");
+        let unread = BorderOpts { box_size: None, ..ring(64.0, 64.0, 9999.0) };
+        assert_eq!(check_borders("div", &top, &colors, 9999.0, &unread)[0].id, "border-accent-on-rounded");
+    }
+
 
     fn hero_opts(text: &str, tag: &str, spacing: f64) -> HeroEyebrowOpts {
         HeroEyebrowOpts {

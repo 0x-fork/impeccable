@@ -161,13 +161,20 @@ pub fn check_element_borders_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
             status_context: is_status_context_element(dom, el),
             tab_context: is_tab_context_element(dom, el),
             corners,
+            // `parse_radius_corners` keeps the horizontal radii only, so an
+            // elliptical corner (`50% / 4px`) leaves the circle test unread.
+            box_size: (!radius_value.contains('/')).then_some([rect.width, rect.height]),
         },
     );
     // A side-tab is a card of text with a coloured edge; a card a visitor
     // cannot see (in a tab pane at opacity 0, a slide parked off its track)
     // shows no edge. Asked only once the border path has reported.
-    if hits.iter().any(|h| h.id == "side-tab") && crate::browser::painted::unpainted_text_box(dom, el).is_some() {
-        hits.retain(|h| h.id != "side-tab");
+    // The same holds for an accent band across a rounded card's top or
+    // bottom (revenpages.fr's mega-menu panel at opacity 0, visibility
+    // hidden, observations-1010 row 17).
+    let edge_rule = |h: &RuleHit| h.id == "side-tab" || h.id == "border-accent-on-rounded";
+    if hits.iter().any(edge_rule) && crate::browser::painted::unpainted_text_box(dom, el).is_some() {
+        hits.retain(|h| !edge_rule(h));
     }
     hits
 }
@@ -3719,6 +3726,9 @@ pub fn check_element_glow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
 /// A stop painting under this much alpha is a tint over whatever sits behind
 /// it, not a palette decision (Tailwind's `/5` and `/10` fills, 0.13 washes).
 const AI_PALETTE_MIN_STOP_ALPHA: f64 = 0.15;
+/// A gradient of one colour whose every stop keeps this much alpha or more
+/// is that colour laid flat, not a fade.
+const AI_PALETTE_SAME_COLOUR_FADE_MIN_ALPHA: f64 = 0.75;
 /// Past this blur radius a gradient is atmosphere: no edge and no hue
 /// survives it as something a visitor reads as a color choice.
 const AI_PALETTE_MAX_BLUR_PX: f64 = 24.0;
@@ -3914,6 +3924,15 @@ fn ai_palette_gradient_hit(
             && c.b == first.b
             && c.alpha_or_one() == first.alpha_or_one()
     }) {
+        return None;
+    }
+    // One colour fading only a little (articulation-hub.vercel.app's
+    // `rgb(29, 74, 84)` to the same at 0.8, observations-1010 row 14) still
+    // reads as that flat colour over what lies behind; the ramp a glow blob
+    // draws runs down toward transparent.
+    if stops.iter().all(|c| c.r == first.r && c.g == first.g && c.b == first.b)
+        && stops.iter().all(|c| c.alpha_or_one() >= AI_PALETTE_SAME_COLOUR_FADE_MIN_ALPHA)
+    {
         return None;
     }
     let rect = element_rect(dom, el)?;
@@ -9057,6 +9076,68 @@ mod tests {
         assert!(check_element_borders_dom(&d, card).is_empty());
     }
 
+    /// observations-1010 row 17 (revenpages.fr 10139645): an accent band
+    /// across the top of a rounded mega-menu panel parked at opacity 0 and
+    /// `visibility: hidden` shows no band. The open panel reports.
+    #[test]
+    fn border_accent_on_rounded_skips_a_panel_nobody_sees() {
+        let (mut d, body) = page();
+        let menu = d.add(Some(body), "div");
+        d.set_rect(menu, 0.0, 0.0, 900.0, 400.0);
+        let panel = d.add(Some(menu), "div");
+        d.set_rect(panel, 0.0, 0.0, 280.0, 320.0);
+        d.add_text(panel, "Our services and how we work");
+        d.set_styles(
+            panel,
+            &[
+                ("borderTopWidth", "3px"),
+                ("borderTopColor", "rgb(235, 87, 71)"),
+                ("borderRightWidth", "0px"),
+                ("borderBottomWidth", "0px"),
+                ("borderLeftWidth", "0px"),
+                ("borderRadius", "4px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ],
+        );
+        let hits = check_element_borders_dom(&d, panel);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, "border-accent-on-rounded");
+        d.set_styles(menu, &[("opacity", "0"), ("visibility", "hidden")]);
+        assert!(check_element_borders_dom(&d, panel).is_empty());
+    }
+
+    /// observations-1010 row 6 (mypip.dev 10137997): the browser form reads
+    /// the circle off the element's own box.
+    #[test]
+    fn a_border_arc_on_a_ring_is_not_a_side_tab() {
+        let (mut d, body) = page();
+        let ring = d.add(Some(body), "div");
+        d.set_rect(ring, 100.0, 100.0, 64.0, 64.0);
+        d.set_styles(
+            ring,
+            &[
+                ("borderTopWidth", "0px"),
+                ("borderRightWidth", "2px"),
+                ("borderRightColor", "rgb(45, 212, 191)"),
+                ("borderBottomWidth", "0px"),
+                ("borderLeftWidth", "0px"),
+                ("borderRadius", "9999px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ],
+        );
+        assert!(check_element_borders_dom(&d, ring).is_empty());
+        // Corners flattened to 4px vertically are not a circle.
+        d.set_style(ring, "borderRadius", "50% / 4px");
+        assert_eq!(check_element_borders_dom(&d, ring).len(), 1);
+        d.set_style(ring, "borderRadius", "9999px");
+        // The same border on a wide rounded card is a side tab.
+        d.set_rect(ring, 100.0, 100.0, 320.0, 64.0);
+        d.set_style(ring, "borderRadius", "12px");
+        let hits = check_element_borders_dom(&d, ring);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, "side-tab");
+    }
+
     /// Bootstrap's floating labels and `placeholder:text-transparent` hide the
     /// placeholder so a label can take its place.
     #[test]
@@ -9359,6 +9440,28 @@ mod tests {
         let hits = palette_hits(&d, overlay);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].snippet, "Purple/violet gradient background");
+    }
+
+    /// observations-1010 row 14 (articulation-hub.vercel.app 10136044): one
+    /// colour fading only to 0.8 (0.75 or more) is that colour laid flat. The same colour
+    /// fading toward transparent is a glow blob and reports.
+    #[test]
+    fn ai_palette_gradient_skips_a_colour_that_barely_fades() {
+        let (mut d, body) = page();
+        let flat = gradient_surface(&mut d, body, "linear-gradient(135deg, rgb(29, 74, 84), rgba(29, 74, 84, 0.8))");
+        assert!(palette_hits(&d, flat).is_empty());
+        let blob = gradient_surface(&mut d, body, "radial-gradient(50% 50%, rgb(20, 184, 166) 0%, rgba(20, 184, 166, 0) 100%)");
+        assert_eq!(palette_hits(&d, blob)[0].snippet, "Cyan gradient background");
+        let half = gradient_surface(&mut d, body, "linear-gradient(90deg, rgb(20, 184, 166), rgba(20, 184, 166, 0.4))");
+        assert_eq!(palette_hits(&d, half)[0].snippet, "Cyan gradient background");
+        // Review of round 14: teal to the same at 0.5 or 0.6, and the
+        // stock violet to lavender, are visible two-tone ramps.
+        for end in ["0.5", "0.6"] {
+            let ramp = gradient_surface(&mut d, body, &format!("linear-gradient(90deg, rgb(20, 184, 166), rgba(20, 184, 166, {end}))"));
+            assert_eq!(palette_hits(&d, ramp)[0].snippet, "Cyan gradient background", "{end}");
+        }
+        let violet = gradient_surface(&mut d, body, "linear-gradient(135deg, rgb(124, 58, 237), rgba(124, 58, 237, 0.5))");
+        assert_eq!(palette_hits(&d, violet)[0].snippet, "Purple/violet gradient background");
     }
 
     /// observations-1004 row 24 (librairielorguaise.fr 10046523): a 7px
